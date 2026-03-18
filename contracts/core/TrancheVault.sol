@@ -9,13 +9,14 @@ import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "../tokens/StableToken.sol";
 import "../tokens/LeverageToken.sol";
 import "../config/ProtocolConfig.sol";
+import "../interfaces/ITrancheVault.sol";
 import "../interfaces/ITreasury.sol";
 import "../interfaces/IInterestManager.sol";
 import "../interfaces/IOracleManager.sol";
 import "../interfaces/ILiquidationManager.sol";
 import "../libraries/DataTypes.sol";
 
-contract TrancheVault is ReentrancyGuard {
+contract TrancheVault is ITrancheVault, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.UintSet;
     using SafeERC20 for IERC20;
 
@@ -42,7 +43,6 @@ contract TrancheVault is ReentrancyGuard {
     IOracleManager public oracleManager;
     ILiquidationManager public liquidationManager;    // 當前合約狀態
     State public state;
-    bool private _systemInitialized = false;
 
     // 白名單功能
     bool public whitelistMintEnabled = true; // 默认开启白名单铸币，上线后可手动关闭变为公开铸币
@@ -59,7 +59,6 @@ contract TrancheVault is ReentrancyGuard {
 
     // ================= Events =================
     event StateTransition(State oldState, State newState);
-    event SystemInitialized(address indexed interestManager, address indexed oracleManager);
     event InterestManagerUpdated(address indexed oldInterestManager, address indexed newInterestManager);
     event OracleManagerUpdated(address indexed oldOracleManager, address indexed newOracleManager);
     event LiquidationManagerUpdated(address indexed oldLiquidationManager, address indexed newLiquidationManager);
@@ -170,11 +169,11 @@ contract TrancheVault is ReentrancyGuard {
         uint256 sAmountInWei,
         uint256 lAmountInWei
     ) {
-        (uint underlyingPriceInWei, , bool isValid) = oracleManager.getLatestPriceView(address(underlyingToken));
+        (uint underlyingPriceInWei, , bool isValid) = oracleManager.getLatestPriceView();
         require(isValid, "Invalid price");
 
-        uint256 fee = config.calcMintFee(underlyingAmountInWei);
-        uint256 underlyingAmountInWeiAfterFee = underlyingAmountInWei - fee;
+        uint256 fee = config.calcMintFee(underlyingAmountInWei);//以underlying數量表示的fee
+        uint256 underlyingAmountInWeiAfterFee = underlyingAmountInWei - fee;//實際用戶抵押的underlying, 用於mint出S & L
         
         uint256 totalValueInWei = underlyingPriceInWei * underlyingAmountInWeiAfterFee;
         
@@ -195,7 +194,7 @@ contract TrancheVault is ReentrancyGuard {
             require(isWhitelisted[receiver], "Receiver not in whitelist");
         }
 
-        (uint mintPriceInWei, , bool isValid) = oracleManager.getLatestPriceView(address(underlyingToken));
+        (uint mintPriceInWei, , bool isValid) = oracleManager.getLatestPriceView();
         require(isValid, "Invalid price");
 
         require(LTVInBps > 0 && LTVInBps < config.maxLTVInBps(), "Invalid LTV");
@@ -208,6 +207,7 @@ contract TrancheVault is ReentrancyGuard {
         sAmountInWei = (totalValue * LTVInBps) / (config.BPS_DENOMINATOR() * 1E18);
         lAmountInWei = (totalValue / 1E18) - sAmountInWei;
     
+        //
         require(underlyingToken.allowance(msg.sender, address(this)) >= underlyingAmountInWei, "Insufficient allowance");
         
         if (mintFee > 0) {
@@ -227,10 +227,8 @@ contract TrancheVault is ReentrancyGuard {
             lAmountInWei
         );
 
-        //在interestManager/LiquidationManager中更新状态, 分別保存在以下兩個變量中
+        //在interestManager中更新状态, 保存在變量中
         //mapping(address => mapping(uint256 => UserInterestData)) public userInterestData;
-        //mapping(address => mapping(uint256 => UserLiquidationStatus)) public userLiquidationStatus;
-        liquidationManager.updateLiquidationStatus(receiver, tokenId, lAmountInWei);
         interestManager.recordPosition(receiver, tokenId, sAmountInWei, lAmountInWei);
 
         emit Mint(receiver, underlyingAmountInWeiAfterFee, mintPriceInWei, LTVInBps, sAmountInWei, lAmountInWei);
@@ -248,28 +246,50 @@ contract TrancheVault is ReentrancyGuard {
     ){
         require(burnPercentageInBps > 0 && burnPercentageInBps <= config.BPS_DENOMINATOR(), "Invalid percentage");
         require(leverageToken.balanceOf(msg.sender, tokenId) > 0, "No L tokens to burn");
+        require(liquidationManager.checkFreezeStatus(msg.sender, tokenId)==false, "Cannot burn when frozen");
 
-        // (uint256 underlyingPriceInWei, , bool isValid) = oracleManager.getLatestPriceView(address(underlyingToken));
-        // require(isValid && underlyingPriceInWei > 0, "Invalid price");
+        (uint256 currentPriceInWei, , bool isValid) = oracleManager.getLatestPriceView();
+        require(isValid && currentPriceInWei > 0, "Invalid price");
 
         (
-            uint256 sAmountNeededInWei, //實際匹配的S token數量
-            uint256 lAmountBurnedInWei, //實際burn掉的L token數量
-            uint256 underlyingAmountInWei,  //扣除利息前應該返還的underlying 數量
-            uint256 deductInterestInWei, //檔次扣除利息金額：截至執行previewBurn時刻，纍計的利息*檔次百分比
-            uint256 underlyingAmountToInterestManager, //檔次扣除金額以underlying支付的實際數量
-            uint256 underlyingAmountToUser,//實際返回給用戶的underlying數量
-            uint256 burnFeeInWei //
-        ) = previewBurn(tokenId, burnPercentageInBps);
+            uint256 totalUnderlyingAmountInWei, 
+            , 
+            ,
+            uint256 totalSAmountInWei, 
+            uint256 totalLAmountInWei, 
+            ,
+            bool isLocked
+        ) = leverageToken.getTokenInfo(tokenId);
+        require(!isLocked, "Token is locked");
 
-
+        uint256 sAmountNeededInWei = (totalSAmountInWei * burnPercentageInBps) / config.BPS_DENOMINATOR();
+        uint256 lAmountBurnedInWei = (totalLAmountInWei * burnPercentageInBps) / config.BPS_DENOMINATOR();
+        uint256 underlyingAmountInWei = (totalUnderlyingAmountInWei * burnPercentageInBps) / config.BPS_DENOMINATOR();
 
         require(stableToken.balanceOf(msg.sender) >= sAmountNeededInWei, "Insufficient S balance");
         require(userCollateral[msg.sender] >= underlyingAmountInWei, "Insufficient collateral");
 
+        // 1. 真實扣減利息：從 InterestManager 取得最精確的應扣利息 (USD 價值)
+        uint256 exactDeductInterestInUSD = interestManager.updatePosition(msg.sender, tokenId, burnPercentageInBps);
         
+        // 2. 將扣除的利息轉換為底層資產數量 (必須被該次 Burn 的抵押品數量 Cap 住，防穿倉超扣)
+        uint256 rawUnderlyingToInterest = (exactDeductInterestInUSD * 1e18) / currentPriceInWei;
+        uint256 underlyingAmountToInterestManager = rawUnderlyingToInterest > underlyingAmountInWei ? underlyingAmountInWei : rawUnderlyingToInterest;
+        
+        // 3. 計算用戶實際能拿回多少底層資產
+        uint256 remainingUnderlying = underlyingAmountInWei - underlyingAmountToInterestManager;
 
-        stableToken.burn(msg.sender, sAmountNeededInWei);
+        uint256 burnFeeInWei = config.calcBurnFee(remainingUnderlying);
+        uint256 underlyingAmountToUser = remainingUnderlying - burnFeeInWei;
+
+        // 4. 開始更新 Vault 狀態與銷毀代幣
+        // 检查是否被清算保护，如果被保护，说明用户已经支付给treasury，需要从treasury中burn sAmountNeededInWei
+        bool islooked = liquidationManager.checkLockStatus(msg.sender, tokenId);
+        if(islooked){
+            stableToken.burn(address(treasury), sAmountNeededInWei);
+        }else{        
+            stableToken.burn(msg.sender, sAmountNeededInWei);
+        }
         leverageToken.burn(msg.sender, tokenId, lAmountBurnedInWei);
 
         uint256 newSAmountInWei;
@@ -280,7 +300,6 @@ contract TrancheVault is ReentrancyGuard {
             newSAmountInWei = 0;
             newLAmountInWei = 0;
         } else {
-            (uint256 totalUnderlyingAmountInWei, , , uint256 totalSAmountInWei, uint256 totalLAmountInWei, , ) = leverageToken.getTokenInfo(tokenId);
             newSAmountInWei = totalSAmountInWei - sAmountNeededInWei;
             newLAmountInWei = totalLAmountInWei - lAmountBurnedInWei;
             leverageToken.updateStokenAmount(tokenId, newSAmountInWei);
@@ -293,8 +312,7 @@ contract TrancheVault is ReentrancyGuard {
         totalSupplyS -= sAmountNeededInWei;
         totalSupplyL -= lAmountBurnedInWei;
 
-
-
+        // 5. 資金劃轉
         if (underlyingAmountToUser > 0) {
             treasury.withdraw(msg.sender, underlyingAmountToUser);
         }
@@ -305,10 +323,6 @@ contract TrancheVault is ReentrancyGuard {
             treasury.withdraw(config.feeRecipient(), burnFeeInWei);
         }
 
-        //在LiquidationManager & InterestManager 中信息
-        liquidationManager.updateLiquidationStatus(msg.sender, tokenId, newLAmountInWei);
-        interestManager.updatePosition(msg.sender, tokenId,newSAmountInWei,newLAmountInWei, deductInterestInWei);
-
         stableTokenBurnedInWei = sAmountNeededInWei;
         leverageTokenBurnedInWei = lAmountBurnedInWei;
         underlyingAmountRedeemedInWei = underlyingAmountToUser;
@@ -318,6 +332,7 @@ contract TrancheVault is ReentrancyGuard {
     // ================= Public Functions =================
     
     function previewBurn(
+        address user,
         uint256 tokenId,
         uint256 burnPercentageInBps
     ) public view returns (
@@ -331,7 +346,7 @@ contract TrancheVault is ReentrancyGuard {
     ) {
         require(burnPercentageInBps > 0 && burnPercentageInBps <= config.BPS_DENOMINATOR(), "Invalid percentage");
 
-        (uint256 currentPriceInWei, , bool isValid) = oracleManager.getLatestPriceView(address(underlyingToken));
+        (uint256 currentPriceInWei, , bool isValid) = oracleManager.getLatestPriceView();
         require(isValid && currentPriceInWei > 0, "Invalid price");
 
         (
@@ -351,50 +366,70 @@ contract TrancheVault is ReentrancyGuard {
         underlyingAmountInWei = (totalUnderlyingAmountInWei * burnPercentageInBps) / config.BPS_DENOMINATOR();
 
         //change interest from USD to underlying
-        uint256 totalInterestInWei = interestManager.previewAccruedInterest(address(0), tokenId); 
+        uint256 totalInterestInWei = interestManager.previewAccruedInterest(user, tokenId); 
         deductInterestInWei = (totalInterestInWei * burnPercentageInBps) / config.BPS_DENOMINATOR();
         
 
-        uint256 deductUnderlyingAmountInWei = (deductInterestInWei * 1e18) / currentPriceInWei;
-        underlyingAmountToInterestManager = deductUnderlyingAmountInWei;
+        uint256 rawUnderlyingToInterest = (deductInterestInWei * 1e18) / currentPriceInWei;
+        underlyingAmountToInterestManager = rawUnderlyingToInterest > underlyingAmountInWei ? underlyingAmountInWei : rawUnderlyingToInterest;
 
-        uint256 remainingUnderlying = underlyingAmountInWei > underlyingAmountToInterestManager 
-            ? underlyingAmountInWei - underlyingAmountToInterestManager 
-            : 0;
+        /*
+         * underlyingAmountInWei：由於本次burn需要從colleteral中扣除的縂的Underlying數量
+         * rawUnderlyingToInterest: 借貸S需要支付的利息體現為Underlying的數量
+         * remainingUnderlying：扣除利息後的Underlying數量
+         * underlyingAmountToUser：扣除Burn fee之後實際返回給用戶的Underlying數量
+        */
+        uint256 remainingUnderlying = underlyingAmountInWei - underlyingAmountToInterestManager;
 
         burnFeeInWei = config.calcBurnFee(remainingUnderlying);
         underlyingAmountToUser = remainingUnderlying - burnFeeInWei;
     }
 
     // ================= External Functions (Liquidation Actions) =================
+    // ================= External Functions (Liquidation Actions) =================
+    function UTAdrs() external view returns (address) {
+        return address(underlyingToken);
+    }
+    function OMAdrs() external view returns (address) {
+        return address(oracleManager);
+    }
+    function freezeStable(address user, uint256 valueToBeFreezed) external onlyRole(config.LIQUIDATION_ROLE()){
+        require(stableToken.balanceOf(user) >= valueToBeFreezed, "Insufficient S token balance");
+        require(stableToken.allowance(user, address(this)) >= valueToBeFreezed, "Insufficient S token allowance");
+        IERC20(address(stableToken)).safeTransferFrom(user, address(treasury), valueToBeFreezed);
+    }
+
+    function unfreezeStable(address user, uint256 valueToBeUnfreezed) external onlyRole(config.LIQUIDATION_ROLE()){
+        treasury.withdrawS(user, valueToBeUnfreezed);
+    }
     
     function burnLTokenFromLiquidation(address user, uint256 tokenId, uint256 balance) external onlyRole(config.LIQUIDATION_ROLE()) {
         leverageToken.burn(user, tokenId, balance);
+        leverageToken.updateStokenAmount(tokenId, 0);
+        leverageToken.updateLtokenAmount(tokenId, 0);
+        leverageToken.updateUnderlyingAmount(tokenId,0);
         totalSupplyL -= balance;
         emit BurnLTokenInLiquidation(user, tokenId, balance);
 
         uint256 totalInterestInWei = interestManager.previewAccruedInterest(user, tokenId);
         uint256 underlyingAmountToInterestManager; 
         
-        (uint256 currentPriceInWei, , bool isValid) = oracleManager.getLatestPriceView(address(underlyingToken));
+        (uint256 currentPriceInWei, , bool isValid) = oracleManager.getLatestPriceView();
         
         if (isValid && currentPriceInWei > 0) {
-            uint256 deductUnderlyingAmountInWei = totalInterestInWei * 1e18 / currentPriceInWei;    
+            uint256 deductUnderlyingAmountInWei = totalInterestInWei * 1E18 / currentPriceInWei;    
             underlyingAmountToInterestManager = deductUnderlyingAmountInWei;
         } else {
             underlyingAmountToInterestManager = 0;
         }
 
         if (underlyingAmountToInterestManager > 0) {
-            underlyingToken.safeTransfer(address(interestManager), underlyingAmountToInterestManager);
+            treasury.withdraw(address(interestManager), underlyingAmountToInterestManager);
         }
 
         interestManager.updatePosition(user, tokenId, 0,0,totalInterestInWei);
     }
 
-    function backToUser(address user, uint256 amountToUser) external onlyRole(config.AUCTION_ROLE()) {
-        underlyingToken.safeTransfer(user, amountToUser);
-    } 
 
     function burnSToken(address kpr, uint256 stableAmount) external onlyRole(config.AUCTION_ROLE()) {
         require(stableToken.balanceOf(kpr) >= stableAmount, "Insufficient S token balance");
@@ -406,9 +441,9 @@ contract TrancheVault is ReentrancyGuard {
         totalSupplyS -= stableAmount; 
     }
 
-    function transferUnderlyingToKpr(address kpr, uint256 underlyingAmount) external onlyRole(config.AUCTION_ROLE()) {
-        require(underlyingToken.balanceOf(address(this)) >= underlyingAmount, 'underlyingType amount not enough');
-        underlyingToken.safeTransfer(kpr, underlyingAmount);
+    function transferUnderlying(address kpr, uint256 underlyingAmount) external onlyRole(config.AUCTION_ROLE()) {
+        require(underlyingToken.balanceOf(address(treasury)) >= underlyingAmount, 'TV/ Insufficient underlying in Treasury');
+        treasury.withdraw(kpr, underlyingAmount);
         CollateralInWei -= underlyingAmount; 
     }
 

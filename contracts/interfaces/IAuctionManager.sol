@@ -4,7 +4,6 @@ pragma solidity ^0.8.20;
 interface IAuctionManager {
     function startAuction(
         uint256 valueToBeBurned,
-        uint256 penalty,
         address originalOwner,
         uint256 tokenId,
         uint256 underlyingValueToUser,

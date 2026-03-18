@@ -8,7 +8,7 @@ contract ProtocolConfig is AccessControl {
     /* ==================== ERRORS ==================== */
     error InvalidFeeBps(uint16 feeBps);
     error InvalidAddress();
-    error InvalidMaxPriceAge();
+    error InvalidOracleParams();
     error InvalidMaxLTVBps(uint256 maxLTVBps);
 
     /* ==================== ROLES & CONSTANTS ==================== */
@@ -21,6 +21,7 @@ contract ProtocolConfig is AccessControl {
     bytes32 public constant LIQUIDATION_ROLE = keccak256("LIQUIDATION_ROLE");   
     bytes32 public constant AUCTION_ROLE = keccak256("AUCTION_ROLE");
     bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE"); 
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
 
     // 常數
     uint16 public constant BPS_DENOMINATOR = 10_000;
@@ -40,8 +41,8 @@ contract ProtocolConfig is AccessControl {
 
     struct AuctionParams {
         uint256 priceMultiplier;     // 增加起始价格的乘数因子 
-        uint256 resetTime;           // 拍卖重置前的时间 [seconds]
-        uint256 priceDropThreshold;  // 拍卖重置前的价格下降百分比
+        uint256 resetTime;           // 拍卖有效期 [seconds]
+        uint256 priceDropThreshold;  // 拍卖价格下限乘子
         uint256 percentageReward;    // 激励keeper的百分比费用 
         uint256 fixedReward;         // 激励keeper的固定费用 
         uint256 minAuctionAmount;    // 最小购买数量 
@@ -55,15 +56,22 @@ contract ProtocolConfig is AccessControl {
         uint256 collateralRiskPremiumInBps;// 抵押风险溢价（基点，100 = 1%）
     }
 
+    struct OracleParams {
+        uint256 delay;
+        uint256 maxPriceAge;
+    }
+
     /* ==================== STATE VARIABLES ==================== */
     uint16 public mintFeeBps;       // e.g. 30 = 0.30%
     uint16 public burnFeeBps;       // e.g. 50 = 0.50%
     address public feeRecipient;    // Treasury
-    uint256 public maxPriceAge;     // seconds, e.g. 3600
+    // uint256 public maxPriceAge;     // seconds, e.g. 3600
     uint256 public maxLTVInBps = 7_500; // 75%
 
+    // Oracle Parameters
+    OracleParams public oracleParams;
+
     // Liquidation Parameters
-    uint256 public adjustmentThreshold = 5 * 10**17;     // 净值调整阈值: 0.5   
     uint256 public liquidationThreshold = 3 * 10**17;    // 强制清算阈值: 0.3   
     uint256 public liquidationPenalty = 3 * 10**16;      // 清算惩罚金: 0.03    
     bool public liquidationEnabled = true;               // 清算功能是否启用    
@@ -82,10 +90,10 @@ contract ProtocolConfig is AccessControl {
     event MintFeeUpdated(uint16 oldFeeBps, uint16 newFeeBps);
     event BurnFeeUpdated(uint16 oldFeeBps, uint16 newFeeBps);
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
-    event MaxPriceAgeUpdated(uint256 oldMaxPriceAge, uint256 newMaxPriceAge);   
+    event OracleParamsUpdated(uint256 oldDelay, uint256 oldMaxPriceAge, uint256 newDelay, uint256 newMaxPriceAge);   
     event MaxLTVUpdated(uint256 oldMaxLTVBps, uint256 newMaxLTVBps);
     event MaxLTVUpdateScheduled(uint256 newMaxLTVBps, uint256 executeTime);     
-    event LiquidationParamsUpdated(uint256 adjustmentThreshold, uint256 liquidationThreshold, uint256 liquidationPenalty);
+    event LiquidationParamsUpdated(uint256 liquidationThreshold, uint256 liquidationPenalty);
     event LiquidationStatusUpdated(bool enabled);
     event AuctionParamsUpdated();
     event CircuitBreakerUpdated(uint256 level);
@@ -97,13 +105,11 @@ contract ProtocolConfig is AccessControl {
         address _feeRecipient,
         uint16 _mintFeeBps,
         uint16 _burnFeeBps,
-        uint256 _maxPriceAge,
         uint256 _maxLTVInBps
     ) {
         if (_mintFeeBps > MAX_FEE_BPS || _burnFeeBps > MAX_FEE_BPS) {
             revert InvalidFeeBps(_mintFeeBps > MAX_FEE_BPS ? _mintFeeBps : _burnFeeBps);
         }
-        if (_maxPriceAge == 0) revert InvalidMaxPriceAge();
         if (_maxLTVInBps == 0 || _maxLTVInBps > BPS_DENOMINATOR) revert InvalidMaxLTVBps(_maxLTVInBps);
 
         _grantRole(DEFAULT_ADMIN_ROLE, safeAddress);
@@ -111,8 +117,13 @@ contract ProtocolConfig is AccessControl {
         feeRecipient = _feeRecipient;
         mintFeeBps = _mintFeeBps;
         burnFeeBps = _burnFeeBps;
-        maxPriceAge = _maxPriceAge;
         maxLTVInBps = _maxLTVInBps;
+
+        // Initialize default oracle params
+        oracleParams = OracleParams({
+            delay: 3600,
+            maxPriceAge: 7200
+        });
 
         // Initialize default auction params
         auctionParams = AuctionParams({
@@ -154,11 +165,13 @@ contract ProtocolConfig is AccessControl {
         feeRecipient = newRecipient;
         emit FeeRecipientUpdated(old, newRecipient);
     }
-    function setMaxPriceAge(uint256 newMaxPriceAge) external onlyRole(PARAM_ROLE) {
-        if (newMaxPriceAge == 0) revert InvalidMaxPriceAge();
-        uint256 old = maxPriceAge;
-        maxPriceAge = newMaxPriceAge;
-        emit MaxPriceAgeUpdated(old, newMaxPriceAge);
+    function setOracleParams(uint256 newDelay, uint256 newMaxPriceAge) external onlyRole(PARAM_ROLE) {
+        if (newDelay==0 || newMaxPriceAge == 0) revert InvalidOracleParams();
+        uint256 oldDelay = oracleParams.delay;
+        uint256 oldMaxPriceAge = oracleParams.maxPriceAge;
+        oracleParams.delay = newDelay;
+        oracleParams.maxPriceAge = newMaxPriceAge;
+        emit OracleParamsUpdated(oldDelay, oldMaxPriceAge, newDelay, newMaxPriceAge);
     }
     function setFees(uint16 newMintFeeBps, uint16 newBurnFeeBps) external onlyRole(PARAM_ROLE) {
         if (newMintFeeBps > MAX_FEE_BPS) revert InvalidFeeBps(newMintFeeBps);   
@@ -173,15 +186,12 @@ contract ProtocolConfig is AccessControl {
 
     /* ==================== LIQUIDATION SETTERS ==================== */
     function setLiquidationParams(
-        uint256 newAdjustmentThreshold,
         uint256 newLiquidationThreshold,
         uint256 newLiquidationPenalty
     ) external onlyRole(PARAM_ROLE) {
-        require(newAdjustmentThreshold > newLiquidationThreshold, "Invalid thresholds");
-        adjustmentThreshold = newAdjustmentThreshold;
         liquidationThreshold = newLiquidationThreshold;
         liquidationPenalty = newLiquidationPenalty;
-        emit LiquidationParamsUpdated(newAdjustmentThreshold, newLiquidationThreshold, newLiquidationPenalty);
+        emit LiquidationParamsUpdated(newLiquidationThreshold, newLiquidationPenalty);
     }
     function setLiquidationEnabled(bool enabled) external onlyRole(PARAM_ROLE) {
         liquidationEnabled = enabled;

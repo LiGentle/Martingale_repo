@@ -4,18 +4,13 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "../tokens/StableToken.sol";
 import "./LiquidationManager.sol";
-import "./abaci.sol";
 import "../config/ProtocolConfig.sol";
 import "../interfaces/ITrancheVault.sol";
 import "../interfaces/IOracleManager.sol";
 import "../libraries/MathUtils.sol";
+import "../interfaces/IAuctionManager.sol";
 
-// 方便无本金拍卖
-interface ClipperCallee {
-    function clipperCall(address, uint256, uint256, bytes calldata) external;
-}
-
-contract AuctionManager is ReentrancyGuard {
+contract AuctionManager is ReentrancyGuard, IAuctionManager {
     using MathUtils for uint256;
 
     // --- 数据 ---
@@ -24,7 +19,6 @@ contract AuctionManager is ReentrancyGuard {
     
     ITrancheVault public trancheVault;
     LiquidationManager public liquidationManager;
-    LinearDecrease public priceCalculator;
 
     uint256 public totalAuctions = 0;
     
@@ -32,28 +26,20 @@ contract AuctionManager is ReentrancyGuard {
     mapping(uint256 => bool) public isActiveAuction;
     uint256 public activeAuctionCount;
 
-    // ================ Accounting (auction-level) ==================
-    uint256 public accumulatedReceivedInAuction = 0;
-    uint256 public accumulatedUnderlyingSoldInAuction = 0;
-    uint256 public accumulatedRewardInStable = 0;
 
     struct Auction {
         uint256 valueToBeBurned;      // 需要銷毀的穩定幣的金額 [1e18]
-        int256 underlyingAmount;      // 扣除reward后剩余的底层资产数量 [1e18] 有正负
-        uint256 soldUnderlyingAmount; // 卖掉的underlying数量[1e18]
         address originalOwner;        // 被清算的杠杆币所有者
         uint256 tokenId;              // tokenID
         uint96  startTime;            // 拍卖开始时间
         uint256 startingPrice;        // 起始价格 [1e18]
         uint256 currentPrice;         // 当前价格 [1e18]
-        uint256 totalPayment;         // 累计支付金额  - 拍卖重置时不重置该值
     }
     mapping(uint256 => Auction) public auctions;
 
     // --- 事件 ---
     event TrancheVaultUpdated(address indexed oldVault, address indexed newVault);
     event LiquidationManagerUpdated(address indexed oldManager, address indexed newManager);
-    event PriceCalculatorUpdated(address indexed oldCalculator, address indexed newCalculator);
 
     event AuctionStarted(
         uint256 indexed auctionId,
@@ -118,17 +104,12 @@ contract AuctionManager is ReentrancyGuard {
         liquidationManager = LiquidationManager(_liquidationManager);
     }
     
-    function setPriceCalculator(address _priceCalculator) external onlyRole(config.DEFAULT_ADMIN_ROLE()) {
-        emit PriceCalculatorUpdated(address(priceCalculator), _priceCalculator);
-        priceCalculator = LinearDecrease(_priceCalculator);
-    }
 
     // --- 内部获取预言机价格 ---
     function _getLatestPrice() internal view returns (uint256) {
         require(address(trancheVault) != address(0), "Vault not set");
-        address underlying = trancheVault.underlyingToken();
-        IOracleManager oracle = IOracleManager(trancheVault.oracleManager());
-        (uint256 currentPrice, , bool isValid) = oracle.getLatestPriceView(underlying);
+        IOracleManager oracle = IOracleManager(trancheVault.OMAdrs());
+        (uint256 currentPrice, , bool isValid) = oracle.getLatestPriceView();
         require(currentPrice > 0 && isValid, "Invalid oracle price!");
         return currentPrice;
     }
@@ -138,7 +119,6 @@ contract AuctionManager is ReentrancyGuard {
     // 开始拍卖
     function startAuction(
         uint256 valueToBeBurned,  // 需被销毁的稳定币价值
-        uint256 penalty,          // 惩罚金
         address originalOwner,    // 被清算用户地址
         uint256 tokenId,          // tokenID
         uint256 underlyingValueToUser, // 返还给用户的残值
@@ -173,8 +153,6 @@ contract AuctionManager is ReentrancyGuard {
 
         auctions[auctionId].startingPrice = startingPrice;
         auctions[auctionId].valueToBeBurned = valueToBeBurned;
-        auctions[auctionId].underlyingAmount = int256((valueToBeBurned + penalty).wdiv(currentPrice)) - int256(rewardValue.wdiv(currentPrice));
-        auctions[auctionId].soldUnderlyingAmount = 0;
         auctions[auctionId].originalOwner = originalOwner;
         auctions[auctionId].tokenId = tokenId;
         auctions[auctionId].startTime = uint96(block.timestamp);
@@ -224,7 +202,6 @@ contract AuctionManager is ReentrancyGuard {
             }
         }
 
-        auctions[auctionId].underlyingAmount = auctions[auctionId].underlyingAmount - int256(rewardValue.wdiv(currentPrice));
         trancheVault.transferUnderlying(triggerer, rewardValue.wdiv(currentPrice));
 
         emit AuctionReset(auctionId, valueToBeBurned, startingPrice, originalOwner, auctions[auctionId].tokenId, triggerer, rewardValue);
@@ -242,8 +219,7 @@ contract AuctionManager is ReentrancyGuard {
         uint256 auctionId,           // 拍卖ID
         uint256 maxPurchaseAmount,   // 购买underlying数量的上限 [Wei]
         uint256 maxAcceptablePrice,  // 最高可接受价格 [Wei]
-        address receiver,            // underlying接收者和外部调用地址
-        bytes calldata callData      // 传递给外部调用的数据
+        address receiver           // underlying接收者和外部调用地址
     ) external nonReentrant checkCircuitBreaker(3) {
         require(address(stableToken) != address(0), 'stableToken address is not set');
         ensureApproval(maxPurchaseAmount.wmul(maxAcceptablePrice));
@@ -279,7 +255,6 @@ contract AuctionManager is ReentrancyGuard {
         }
 
         auctions[auctionId].valueToBeBurned = valueToBeBurned - paymentAmount;
-        auctions[auctionId].soldUnderlyingAmount += purchaseSlice;
 
         emit PurchaseMade(auctionId, currentPrice, purchaseSlice, auctions[auctionId].valueToBeBurned, receiver, originalOwner);
 
@@ -289,10 +264,6 @@ contract AuctionManager is ReentrancyGuard {
         }
 
         trancheVault.transferUnderlying(receiver, purchaseSlice);
-
-        if (callData.length > 0 && receiver != address(trancheVault) && receiver != address(liquidationManager)) {
-            ClipperCallee(receiver).clipperCall(msg.sender, paymentAmount, purchaseSlice, callData);
-        }
         
         trancheVault.burnSToken(msg.sender, paymentAmount);
     }
@@ -324,11 +295,17 @@ contract AuctionManager is ReentrancyGuard {
         valueToBeBurned = auctions[auctionId].valueToBeBurned;
     }
 
-    function checkAuctionStatus(uint96 startTime, uint256 startingPrice) internal view returns (bool needsReset, uint256 currentPrice) {
-        currentPrice = priceCalculator.price(startingPrice, block.timestamp - startTime);
-        
+    function checkAuctionStatus(uint96 startTime, uint256 startingPrice) internal view returns (bool needsReset, uint256 currentPrice) {        
         (,uint256 resetTime,uint256 priceDropThreshold,,,) = config.auctionParams();
-        needsReset = ((block.timestamp - startTime) > resetTime || currentPrice.wdiv(startingPrice) < priceDropThreshold);
+        uint256 priceLowerBound = startingPrice.wmul(priceDropThreshold);
+        require(priceLowerBound < startingPrice, "AM/ invalid priceDropThreshold");
+        uint256 timeElapsed = block.timestamp - startTime;
+        needsReset = timeElapsed >= resetTime;
+        if (needsReset){
+            currentPrice = priceLowerBound;
+        } else {
+            currentPrice = (startingPrice - priceLowerBound).wmul((resetTime - timeElapsed).wdiv(resetTime)) + priceLowerBound;
+        }
     }
 
     // 取消拍卖（紧急情况或治理操作）

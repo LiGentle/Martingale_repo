@@ -3,7 +3,9 @@ pragma solidity ^0.8.20;
 
 
 /// @notice Structure to hold information about a specific token type
+
 struct TokenInfo {
+    //記錄用戶特定的id：抵押資產的數量 & 所鑄幣的S數量 & 所鑄幣的L數量
     uint256 underlyingAmountInWei;      // The amount of underlying asset deposited for this token
     uint256 mintPriceInWei;    // The initial mint price (P0)
     uint256 LTVInBps;          // The loan-to-value ratio initially,5_000 (50%)

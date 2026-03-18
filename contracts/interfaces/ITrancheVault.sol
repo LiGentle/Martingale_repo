@@ -3,12 +3,13 @@ pragma solidity ^0.8.20;
 
 interface ITrancheVault {
     // State variables (auto-generated getters)
-    function underlyingToken() external view returns (address);
-    function oracleManager() external view returns (address);
+    function UTAdrs() external view returns (address);
+    function OMAdrs() external view returns (address);
 
     // Liquidation hooks
-    function burnLToken(address user, uint256 tokenId, uint256 balance) external;
     function burnLTokenFromLiquidation(address user, uint256 tokenId, uint256 balance) external; // keeping both for safety if one is needed
+    function freezeStable(address user, uint256 sAmountInWei) external;
+    function unfreezeStable(address user, uint256 sAmountInWei) external;
 
     // Auction hooks
     function transferUnderlying(address receiver, uint256 underlyingAmountInWei) external;

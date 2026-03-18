@@ -3,18 +3,21 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "../tokens/StableToken.sol";
 import "../config/ProtocolConfig.sol";
+import "../interfaces/ITreasury.sol";
 
 //存放抵押資產的Treasury合約只要這樣定義就足夠嗎，如何防止攻擊？
 //作爲僅僅存放用戶資產的Treasury合約是否有什麽標準？
 //我在TrancheVault中執行burn時,會調用withdraw,所以這裏是不是不能是onlyOwner，而是onlyTrancheVault合約
 //項目需要定期存入資產，在該合約中幫我定義一個函數，只有某個地址可以存入資產
 
-contract Treasury {
+contract Treasury is ITreasury {
     using SafeERC20 for IERC20;
 
     ProtocolConfig public immutable config;
     IERC20 public immutable underlyingToken;
+    StableToken public immutable stableToken;             
 
     // 定義事件，方便鏈下追蹤收益注入與管理員變更
     event YieldDeposited(address indexed depositor, uint256 amount);
@@ -27,10 +30,12 @@ contract Treasury {
 
     constructor(
         address _config,
-        address _underlyingToken
+        address _underlyingToken,
+        address _STokenAddr
     ) {
         require(_underlyingToken != address(0), "Invalid token address");
         underlyingToken = IERC20(_underlyingToken);
+        stableToken = StableToken(_STokenAddr);
         config = ProtocolConfig(_config);
     }
 
@@ -39,6 +44,10 @@ contract Treasury {
     // 未来如果清算合约需要直接操作资产，只需在 ProtocolConfig 里给清算合约发 VAULT_ROLE 即可
     function withdraw(address to, uint256 amount) external onlyRole(config.VAULT_ROLE()) {
         underlyingToken.safeTransfer(to, amount);
+    }
+
+    function withdrawS(address to, uint256 amount) external onlyRole(config.VAULT_ROLE()) {
+        IERC20(address(stableToken)).safeTransfer(to, amount);
     }
 
     //該函數風險不大，使用onlyRole的意義更多的在於防止有人污染數據
@@ -59,6 +68,9 @@ contract Treasury {
     // 查看余额
     function getBalance() external view returns (uint256) {
         return underlyingToken.balanceOf(address(this));
+    }
+    function getBalanceS() external view returns (uint256) {
+        return IERC20(address(stableToken)).balanceOf(address(this));
     }
 
     // used for fund migration when we upgrade the Treasury contract, only admin can call this function

@@ -28,6 +28,10 @@ contract InterestManager is ReentrancyGuard {
     ITrancheVault public trancheVault;                     // 核心合约
     IStableSwapAMM public ammPool;                         // AMM 池合约地址
 
+    // ================= 全局状态变量 =================
+    uint256 public globalDebtIndex = 1e18; //初始借貸1元, 按照動態利息, 逐漸纍計出來的指數。
+    uint256 public lastUpdateTimestamp;
+
     
     // ================= 利息统计 =================
     
@@ -36,15 +40,16 @@ contract InterestManager is ReentrancyGuard {
     uint256 public totalInterestWithdrawn;                 // 累计提取的利息
     uint256 public totalActivePositions;                   // 活跃持仓数量
     uint256 public totalLeverageAmount;                    // 总杠杆金额
+    uint256 public totalStableAmount;                      // L token总借出資金
+    uint256 public totalScaledStableAmount;                // 全局 S 代币缩放份额总计 (用于 O(1) 计算全系统实时未结利息)
     
     // ================= 用户持仓数据 =================
     
     struct UserInterestData {
-        uint256 sAmountInWei;          // 稳定代币数量, 借出的 stable  stable 代币数量
-        uint256 lAmountInWei;          // 杠杆代币数量
-        uint256 timestamp;             // 最后更新时间
-        uint256 accruedInterest;       // 累计未收取利息，in USD value
-        bool active;                   // 是否活跃
+        uint256 scaledSAmount;          // [核心] 按照全局指數縮放的 S 代幣份額（Shares），決定總負債
+        uint256 principalSAmount;       // 記錄用戶真實借出的 S 代幣「本金」。僅用於分辨總債務中哪部分是利息
+        uint256 LAmount;                // 槓桿代幣數量（維持原樣，用於計算槓桿率和清算）。多少LAmount-->借貸多少principalSAmount
+        bool active;                    // 是否活跃
     }
     
     mapping(address => mapping(uint256 => UserInterestData)) public userInterestData;
@@ -67,6 +72,11 @@ contract InterestManager is ReentrancyGuard {
         _;
     }
 
+    //所有會改變狀態的核心函數套用它，確保每次操作前都先更新全局利息指數
+    modifier accruePositionInterest() {
+        updateGlobalIndex();
+        _;
+    }
     // ================= 构造函数 =================
     
     constructor(
@@ -96,6 +106,42 @@ contract InterestManager is ReentrancyGuard {
         emit AmmPoolChanged(address(ammPool), _newPool);
         ammPool = IStableSwapAMM(_newPool);
     }
+
+    // 每次有操作前，先更新全局指数
+    function updateGlobalIndex() public {
+        if (block.timestamp == lastUpdateTimestamp) return;
+        
+        if (totalStableAmount > 0) { 
+            uint256 deltaTime = block.timestamp - lastUpdateTimestamp;
+            
+            // 1. 取得年化利率 (BPS轉換為小數，使用 1e18 精度)
+            // 例如 5000 BPS = 50% = 0.5 * 1e18 = 500,000,000,000,000,000
+            uint256 annualRateWad = (getCurrentInterestRate() * 1e18) / config.BPS_DENOMINATOR();
+            
+            // 2. 計算每秒利率 (1e18 精度，解決了歸零 Bug)
+            uint256 ratePerSecondWad = annualRateWad / config.SECONDS_PER_YEAR();
+            
+            // 3. Aave 的按秒複利近似算法（展開前兩階）
+            // 第一階: r * t
+            uint256 linearInterest = ratePerSecondWad * deltaTime;
+            
+            // 第二階: r^2 * t * (t-1) / 2
+            uint256 quadraticInterest = 0;
+            if (deltaTime > 1) {
+                quadraticInterest = (ratePerSecondWad * ratePerSecondWad * deltaTime * (deltaTime - 1)) / (2 * 1e18);
+            }
+            
+            // 4. 當前這段時間的複利乘數 = 1 + 第一階 + 第二階 
+            uint256 compoundedMultiplier = 1e18 + linearInterest + quadraticInterest;
+            
+            // 5. 更新全局 Index
+            globalDebtIndex = (globalDebtIndex * compoundedMultiplier) / 1e18;
+        }
+        
+        lastUpdateTimestamp = block.timestamp;
+    }
+
+    
 
 
     // ================= 利率计算函数 =================
@@ -158,96 +204,123 @@ contract InterestManager is ReentrancyGuard {
         uint256 tokenId, 
         uint256 sAmountInWei,
         uint256 lAmountInWei
-    ) external onlyRole(config.VAULT_ROLE())  {
+    ) external onlyRole(config.VAULT_ROLE()) accruePositionInterest {
         
         require(lAmountInWei > 0, "Invalid amount");
         
         UserInterestData storage position = userInterestData[user][tokenId];
         
-        position.sAmountInWei = sAmountInWei;
-        position.lAmountInWei = lAmountInWei;
-        position.timestamp = block.timestamp;
-        position.accruedInterest = 0;
+        // 算出該筆本金在目前 Index 下對應的份額 (Scaled Amount)
+        // 因為有 accruePositionInterest，這裡的 globalDebtIndex 絕對是最新的
+        uint256 scaledSAmount = (sAmountInWei * 1e18) / globalDebtIndex;
+        
+        position.scaledSAmount = scaledSAmount;
+        position.principalSAmount = sAmountInWei;
+        position.LAmount = lAmountInWei;
         position.active = true;
         
         totalActivePositions += 1;
         totalLeverageAmount += lAmountInWei;
+        totalStableAmount += sAmountInWei;
+        totalScaledStableAmount += scaledSAmount;
         
         emit PositionOpened(user, tokenId, sAmountInWei, lAmountInWei, block.timestamp);
 
     }
 
+    //在用戶burn時調用
     function updatePosition(
         address user, 
         uint256 tokenId,
-        uint256 newSAmountInWei, //new S token amount
-        uint256 newLAmountInWei,  //new L token amount
-        uint256 deductInterestInWei //檔次扣除的利息
-    ) external onlyRole(config.VAULT_ROLE())  
+        uint256 burnPercentageInBps // 0-10000，表示本次 burn 的比例
+    ) external onlyRole(config.VAULT_ROLE()) accruePositionInterest returns (uint256 interestAmount)
     {
+        require(burnPercentageInBps > 0 && burnPercentageInBps <= config.BPS_DENOMINATOR(), "Invalid burn percentage");
 
         UserInterestData storage position = userInterestData[user][tokenId];
+        require(position.active, "Position not active");
 
-        //上一次計算以來新的纍計的利息
-        uint256 newAccruedInterest = _calculateAccruedInterest(
-                position.sAmountInWei, 
-                block.timestamp - position.timestamp
-            );
-        position.accruedInterest += newAccruedInterest; // 更新已计算利息
-        position.accruedInterest -= deductInterestInWei; // 先扣除利息，避免用户通过增加杠杆来规避利息扣除
-        position.timestamp = block.timestamp;   
-        position.sAmountInWei = newSAmountInWei;
-        position.lAmountInWei = newLAmountInWei; 
+        // 1. 在扣減之前，先計算出該用戶這部分倉位「原本」欠了多少利息
+        //    因為已經有了 accruePositionInterest，此時 globalDebtIndex 是最新的。
+        //    這一步是為了統計系統收集到的總利息，並回傳給 Vault 進行實際的扣款。
+        uint256 currentTotalDebt = (position.scaledSAmount * globalDebtIndex) / 1e18;
+        uint256 totalInterest = currentTotalDebt > position.principalSAmount ? currentTotalDebt - position.principalSAmount : 0;
+        
+        // 這次 Burn 應該償還/扣除的利息
+        interestAmount = (totalInterest * burnPercentageInBps) / config.BPS_DENOMINATOR();
 
-        if(newSAmountInWei == 0)
-        {
-            position.sAmountInWei = 0;
-            position.lAmountInWei = 0;
-            position.accruedInterest = 0;
-            // position.timestamp = 0;
+        // 更新系統宏觀統計
+        totalInterestAccrued += interestAmount;
+        totalInterestCollected += interestAmount;
+        
+        // 紀錄這次 burn 掉的 S 和 L 的實際數量，用於更新全局變量
+        uint256 burnedSAmount = (position.principalSAmount * burnPercentageInBps) / config.BPS_DENOMINATOR();
+        uint256 burnedLAmount = (position.LAmount * burnPercentageInBps) / config.BPS_DENOMINATOR();
+
+        // 2. 這才是縮放模型最漂亮的地方：按比例直接扣減份額和本金
+        uint256 burnedScaledSAmount = (position.scaledSAmount * burnPercentageInBps) / config.BPS_DENOMINATOR();
+        position.scaledSAmount -= burnedScaledSAmount;
+        position.principalSAmount -= burnedSAmount;
+        position.LAmount -= burnedLAmount;
+        
+        // 更新全局借貸總量
+        totalStableAmount -= burnedSAmount;
+        totalLeverageAmount -= burnedLAmount;
+        totalScaledStableAmount -= burnedScaledSAmount;
+
+        // 3. 如果全部 Burn 完（或剩餘極小塵埃），關閉倉位
+        if (burnPercentageInBps == config.BPS_DENOMINATOR() || position.principalSAmount == 0) {
+            position.scaledSAmount = 0;
+            position.principalSAmount = 0;
+            position.LAmount = 0;
             position.active = false;
             totalActivePositions -= 1;
-
         }
 
+        if (interestAmount > 0) {
+            emit InterestCollected(user, tokenId, interestAmount);
+        }
+
+        return interestAmount;
     }
 
-    function totalAccruedInterest(
-        address user, 
-        uint256 tokenId 
-    ) external onlyRole(config.VAULT_ROLE()) returns (uint256) {
+    function previewAccruedInterest(address user, uint256 tokenId) external view returns (uint256) {
+        UserInterestData memory position = userInterestData[user][tokenId];
         
-        UserInterestData storage position = userInterestData[user][tokenId];
-        
-        if (position.sAmountInWei > 0 && position.active) {
-            uint256 newAccruedInterest = _calculateAccruedInterest(
-                position.sAmountInWei, 
-                block.timestamp - position.timestamp
-            );
+        return _calculateAccruedInterest(position);
+    }
+    
+
+    function _calculateAccruedInterest(UserInterestData memory position) internal view returns (uint256) {
+        if (!position.active || position.scaledSAmount == 0) {
+            return 0;
+        }
+
+        // 預覽最新的 Index
+        uint256 pendingIndex = globalDebtIndex;
+        if (block.timestamp > lastUpdateTimestamp && totalStableAmount > 0) {
+            uint256 deltaTime = block.timestamp - lastUpdateTimestamp;
+            uint256 annualRateWad = (getCurrentInterestRate() * 1e18) / config.BPS_DENOMINATOR();
+            uint256 ratePerSecondWad = annualRateWad / config.SECONDS_PER_YEAR();
             
-            position.accruedInterest += newAccruedInterest;
-            position.timestamp = block.timestamp;
-            
-            totalInterestAccrued += newAccruedInterest;
-            
-            if (newAccruedInterest > 0) {
-                emit InterestAccrued(user, tokenId, newAccruedInterest);
+            uint256 linearInterest = ratePerSecondWad * deltaTime;
+            uint256 quadraticInterest = 0;
+            if (deltaTime > 1) {
+                quadraticInterest = (ratePerSecondWad * ratePerSecondWad * deltaTime * (deltaTime - 1)) / (2 * 1e18);
             }
+            uint256 compoundedMultiplier = 1e18 + linearInterest + quadraticInterest;
+            pendingIndex = (pendingIndex * compoundedMultiplier) / 1e18;
+        }
+
+        // 計算目前總債務 = 份額 (Scaled Amount) * 最新 Index
+        uint256 currentTotalDebt = (position.scaledSAmount * pendingIndex) / 1e18;
+
+        // 利息 = 總債務 - 最初借出的本金
+        if (currentTotalDebt > position.principalSAmount) {
+            return currentTotalDebt - position.principalSAmount;
         }
         
-        return position.accruedInterest;
-    }
-
-    function _calculateAccruedInterest(
-        uint256 sAmountInWei,
-        uint256 holdingTimeInSeconds
-    ) internal view returns (uint256) {
-
-
-        uint256 currentRate = getCurrentInterestRate();
-        uint256 accruedInterest = (sAmountInWei * currentRate * holdingTimeInSeconds) / 
-                                   (config.BPS_DENOMINATOR() * config.SECONDS_PER_YEAR());
-        return accruedInterest;
+        return 0;
     }
 
     function withdrawInterest(address to, uint256 amount) external onlyRole(config.WITHDRAW_ROLE()) nonReentrant {
@@ -255,13 +328,17 @@ contract InterestManager is ReentrancyGuard {
         require(amount <= availableAmount, "Insufficient interest balance");
         
         totalInterestWithdrawn += amount;
+        
+        // ⚠️ Architecture Note: If InterestManager doesn't actually hold the funds (but Vault does), 
+        // you should call vault.transfer() instead of underlyingToken.safeTransfer(to, amount)
         underlyingToken.safeTransfer(to, amount);
         
         emit InterestWithdrawn(to, amount);
     }
     
     function emergencyWithdrawInterest(address to) external onlyRole(config.WITHDRAW_ROLE())  nonReentrant {
-        uint256 availableAmount = totalInterestCollected - totalInterestWithdrawn;
+        // 使用真實的代幣餘額來做緊急提取
+        uint256 availableAmount = underlyingToken.balanceOf(address(this));
         require(availableAmount > 0, "No interest available");
         
         totalInterestWithdrawn += availableAmount;
@@ -276,21 +353,32 @@ contract InterestManager is ReentrancyGuard {
         return userInterestData[user][tokenId];
     }
     
-    function previewAccruedInterest(address user, uint256 tokenId) external view returns (uint256) {
-        UserInterestData memory position = userInterestData[user][tokenId];
-        
-        if (position.sAmountInWei == 0 || !position.active) {
-            return 0;
+
+    function getGlobalUnpaidInterest() public view returns (uint256) {
+        if (totalScaledStableAmount == 0) return 0;
+
+        uint256 pendingIndex = globalDebtIndex;
+        if (block.timestamp > lastUpdateTimestamp && totalStableAmount > 0) {
+            uint256 deltaTime = block.timestamp - lastUpdateTimestamp;
+            uint256 annualRateWad = (getCurrentInterestRate() * 1e18) / config.BPS_DENOMINATOR();
+            uint256 ratePerSecondWad = annualRateWad / config.SECONDS_PER_YEAR();
+            
+            uint256 linearInterest = ratePerSecondWad * deltaTime;
+            uint256 quadraticInterest = 0;
+            if (deltaTime > 1) {
+                quadraticInterest = (ratePerSecondWad * ratePerSecondWad * deltaTime * (deltaTime - 1)) / (2 * 1e18);
+            }
+            uint256 compoundedMultiplier = 1e18 + linearInterest + quadraticInterest;
+            pendingIndex = (pendingIndex * compoundedMultiplier) / 1e18;
         }
-        
-        uint256 newInterest = _calculateAccruedInterest(
-            position.sAmountInWei,
-            block.timestamp - position.timestamp
-        );
-        
-        return position.accruedInterest + newInterest;
+
+        uint256 currentTotalGlobalDebt = (totalScaledStableAmount * pendingIndex) / 1e18;
+        if (currentTotalGlobalDebt > totalStableAmount) {
+            return currentTotalGlobalDebt - totalStableAmount;
+        }
+        return 0;
     }
-    
+
     function getSystemStats() external view returns (
         uint256 accruedAmount,
         uint256 collectedAmount,
@@ -300,21 +388,14 @@ contract InterestManager is ReentrancyGuard {
         uint256 totalLeverage,
         uint256 currentRate
     ) {
-        accruedAmount = totalInterestAccrued;
+        // 全局總產生利息 = 已經收取過的 + 目前未結算的
+        accruedAmount = totalInterestCollected + getGlobalUnpaidInterest();
         collectedAmount = totalInterestCollected;
         withdrawnAmount = totalInterestWithdrawn;
         availableBalance = totalInterestCollected - totalInterestWithdrawn;
         activePositions = totalActivePositions;
         totalLeverage = totalLeverageAmount;
         currentRate = getCurrentInterestRate();
-    }
-    
-    
-    function calculateInterestForAmount(
-        uint256 sAmountInWei,
-        uint256 timeInSeconds
-    ) external view returns (uint256) {
-        return _calculateAccruedInterest(sAmountInWei, timeInSeconds);
     }
     
     function getSystemHealth() external view returns (
@@ -324,8 +405,11 @@ contract InterestManager is ReentrancyGuard {
         bool isHealthy               
     ) {
         uint256 bps = config.BPS_DENOMINATOR();
-        collectionRate = totalInterestAccrued > 0 ? 
-            (totalInterestCollected * bps) / totalInterestAccrued : bps;
+        
+        uint256 currentAccruedAmount = totalInterestCollected + getGlobalUnpaidInterest();
+        
+        collectionRate = currentAccruedAmount > 0 ? 
+            (totalInterestCollected * bps) / currentAccruedAmount : bps;
         
         utilizationRate = totalInterestCollected > 0 ? 
             (totalInterestWithdrawn * bps) / totalInterestCollected : 0;
