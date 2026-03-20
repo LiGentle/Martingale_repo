@@ -62,8 +62,8 @@ contract ProtocolConfig is AccessControl {
     }
 
     /* ==================== STATE VARIABLES ==================== */
-    uint16 public mintFeeBps;       // e.g. 30 = 0.30%
-    uint16 public burnFeeBps;       // e.g. 50 = 0.50%
+    uint16 public mintFeeInBps;       // e.g. 30 = 0.30%
+    uint16 public burnFeeInBps;       // e.g. 50 = 0.50%
     address public feeRecipient;    // Treasury
     // uint256 public maxPriceAge;     // seconds, e.g. 3600
     uint256 public maxLTVInBps = 7_500; // 75%
@@ -103,20 +103,20 @@ contract ProtocolConfig is AccessControl {
     constructor(
         address safeAddress,
         address _feeRecipient,
-        uint16 _mintFeeBps,
-        uint16 _burnFeeBps,
+        uint16 _mintFeeInBps,
+        uint16 _burnFeeInBps,
         uint256 _maxLTVInBps
     ) {
-        if (_mintFeeBps > MAX_FEE_BPS || _burnFeeBps > MAX_FEE_BPS) {
-            revert InvalidFeeBps(_mintFeeBps > MAX_FEE_BPS ? _mintFeeBps : _burnFeeBps);
+        if (_mintFeeInBps > MAX_FEE_BPS || _burnFeeInBps > MAX_FEE_BPS) {
+            revert InvalidFeeBps(_mintFeeInBps > MAX_FEE_BPS ? _mintFeeInBps : _burnFeeInBps);
         }
         if (_maxLTVInBps == 0 || _maxLTVInBps > BPS_DENOMINATOR) revert InvalidMaxLTVBps(_maxLTVInBps);
 
         _grantRole(DEFAULT_ADMIN_ROLE, safeAddress);
         
         feeRecipient = _feeRecipient;
-        mintFeeBps = _mintFeeBps;
-        burnFeeBps = _burnFeeBps;
+        mintFeeInBps = _mintFeeInBps;
+        burnFeeInBps = _burnFeeInBps;
         maxLTVInBps = _maxLTVInBps;
 
         // Initialize default oracle params
@@ -145,18 +145,36 @@ contract ProtocolConfig is AccessControl {
         });
     }
 
+    //一次性授予多個地址多個角色，減少多簽操作的繁瑣程度
+    function batchGrantRoles(
+        bytes32[] calldata roles,
+        address[] calldata accounts
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(roles.length == accounts.length, "Length mismatch");
+        for (uint256 i = 0; i < roles.length; i++) {
+            _grantRole(roles[i], accounts[i]);
+        }
+    }
+
+    //更改特定role的角色員，先revoke舊地址的role，再grant新地址的role
+    function updateRole(bytes32 role, address oldAccount, address newAccount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newAccount != address(0), "Invalid new account");
+        _revokeRole(role, oldAccount);
+        _grantRole(role, newAccount);
+    }
+
     /* ==================== PARAMETER SETTERS ==================== */
     
-    function setMintFeeBps(uint16 newFeeBps) external onlyRole(PARAM_ROLE) {    
+    function setmintFeeInBps(uint16 newFeeBps) external onlyRole(PARAM_ROLE) {    
         if (newFeeBps > MAX_FEE_BPS) revert InvalidFeeBps(newFeeBps);
-        uint16 old = mintFeeBps;
-        mintFeeBps = newFeeBps;
+        uint16 old = mintFeeInBps;
+        mintFeeInBps = newFeeBps;
         emit MintFeeUpdated(old, newFeeBps);
     }
-    function setBurnFeeBps(uint16 newFeeBps) external onlyRole(PARAM_ROLE) {    
+    function setburnFeeInBps(uint16 newFeeBps) external onlyRole(PARAM_ROLE) {    
         if (newFeeBps > MAX_FEE_BPS) revert InvalidFeeBps(newFeeBps);
-        uint16 old = burnFeeBps;
-        burnFeeBps = newFeeBps;
+        uint16 old = burnFeeInBps;
+        burnFeeInBps = newFeeBps;
         emit BurnFeeUpdated(old, newFeeBps);
     }
     function setFeeRecipient(address newRecipient) external onlyRole(PARAM_ROLE) {
@@ -173,15 +191,15 @@ contract ProtocolConfig is AccessControl {
         oracleParams.maxPriceAge = newMaxPriceAge;
         emit OracleParamsUpdated(oldDelay, oldMaxPriceAge, newDelay, newMaxPriceAge);
     }
-    function setFees(uint16 newMintFeeBps, uint16 newBurnFeeBps) external onlyRole(PARAM_ROLE) {
-        if (newMintFeeBps > MAX_FEE_BPS) revert InvalidFeeBps(newMintFeeBps);   
-        if (newBurnFeeBps > MAX_FEE_BPS) revert InvalidFeeBps(newBurnFeeBps);   
-        uint16 oldMint = mintFeeBps;
-        uint16 oldBurn = burnFeeBps;
-        mintFeeBps = newMintFeeBps;
-        burnFeeBps = newBurnFeeBps;
-        emit MintFeeUpdated(oldMint, newMintFeeBps);
-        emit BurnFeeUpdated(oldBurn, newBurnFeeBps);
+    function setFees(uint16 newmintFeeInBps, uint16 newburnFeeInBps) external onlyRole(PARAM_ROLE) {
+        if (newmintFeeInBps > MAX_FEE_BPS) revert InvalidFeeBps(newmintFeeInBps);   
+        if (newburnFeeInBps > MAX_FEE_BPS) revert InvalidFeeBps(newburnFeeInBps);   
+        uint16 oldMint = mintFeeInBps;
+        uint16 oldBurn = burnFeeInBps;
+        mintFeeInBps = newmintFeeInBps;
+        burnFeeInBps = newburnFeeInBps;
+        emit MintFeeUpdated(oldMint, newmintFeeInBps);
+        emit BurnFeeUpdated(oldBurn, newburnFeeInBps);
     }
 
     /* ==================== LIQUIDATION SETTERS ==================== */
@@ -275,9 +293,9 @@ contract ProtocolConfig is AccessControl {
         return (amount * feeBps) / BPS_DENOMINATOR;
     }
     function calcMintFee(uint256 amount) external view returns (uint256) {      
-        return (amount * mintFeeBps) / BPS_DENOMINATOR;
+        return (amount * mintFeeInBps) / BPS_DENOMINATOR;
     }
     function calcBurnFee(uint256 amount) external view returns (uint256) {      
-        return (amount * burnFeeBps) / BPS_DENOMINATOR;
+        return (amount * burnFeeInBps) / BPS_DENOMINATOR;
     }
 }

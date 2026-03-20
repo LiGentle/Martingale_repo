@@ -427,7 +427,7 @@ contract TrancheVault is ITrancheVault, ReentrancyGuard {
             treasury.withdraw(address(interestManager), underlyingAmountToInterestManager);
         }
 
-        interestManager.updatePosition(user, tokenId, 0,0,totalInterestInWei);
+        interestManager.updatePosition(user, tokenId, 10000);
     }
 
 

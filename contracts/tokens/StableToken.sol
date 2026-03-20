@@ -27,9 +27,9 @@ contract StableToken is ERC20 {
         _;
     }
     
- 
-    modifier onlyAdmin() {
-        require(config.hasRole(config.DEFAULT_ADMIN_ROLE(), msg.sender), "Not admin");
+
+    modifier onlyRole(bytes32 role) {
+        require(config.hasRole(role, msg.sender), "Caller missing required role");
         _;
     }
 
@@ -46,7 +46,7 @@ contract StableToken is ERC20 {
     /// @notice Sets a new TrancheVault address
     /// @dev Only an admin can call this function to update the TrancheVault
     /// @param _trancheVault The new TrancheVault address, cannot be the zero address
-    function setTrancheVault(address _trancheVault) external onlyAdmin {
+    function setTrancheVault(address _trancheVault) external onlyRole(config.DEFAULT_ADMIN_ROLE()) {
         require(_trancheVault != address(0), "Invalid TrancheVault address");
         address oldTrancheVault = trancheVault;
         trancheVault = _trancheVault;
