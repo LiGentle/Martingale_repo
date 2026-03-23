@@ -14,37 +14,76 @@ import "../interfaces/ILiquidationManager.sol";
 contract LiquidationManager is ReentrancyGuard, ILiquidationManager {
     using MathUtils for uint256;
 
-    ProtocolConfig public immutable config;
-    LeverageToken public immutable leverageToken;
-    ITrancheVault public  trancheVault;  // 核心合约
-    IAuctionManager public auctionManager;        // 拍卖模块
+    // ================= State Variables =================
 
-    // ================= 用户清算状态 =================
+    /// @notice Protocol configuration contract (immutable)
+    ProtocolConfig public immutable config;
+
+    /// @notice Leverage token contract (immutable)
+    LeverageToken public immutable leverageToken;
+
+    /// @notice Tranche vault interface
+    ITrancheVault public trancheVault;
+
+    /// @notice Auction manager interface
+    IAuctionManager public auctionManager;
+
+    // ================= Data Structures =================
+
+    /// @notice User liquidation status for specific token positions
+    /// @param isLocked Whether the position has protection enabled (cannot be liquidated)
     struct UserLiquidationStatus {
-        bool isFreezed;                // 是否被冻结 币在清算时被冻结，拍卖完成时解冻。冻结期间无法铸币和销毁
-        bool isLocked;                  // 是否被锁定 （锁定后的L无法被清算）
+        bool isLocked;
     }
+
+    /// @notice Mapping of user liquidation status by user address and token ID
     mapping(address => mapping(uint256 => UserLiquidationStatus)) public userLiquidationStatus;
 
-    // ================= 修饰符 =================
+    // ================= Events =================
+
+    /// @notice Emitted when the tranche vault address is updated
+    /// @param oldVault Previous vault address
+    /// @param newVault New vault address
+    event TrancheVaultChanged(address indexed oldVault, address indexed newVault);
+
+    /// @notice Emitted when the auction manager address is updated
+    /// @param oldAuctionManager Previous auction manager address
+    /// @param newAuctionManager New auction manager address
+    event AuctionManagerUpdated(address indexed oldAuctionManager, address indexed newAuctionManager);
+
+    /// @notice Emitted when a liquidation is triggered
+    /// @param user Address of the liquidated user
+    /// @param tokenId Token ID being liquidated
+    /// @param valueToBeBurned Amount of stable tokens to be burned
+    /// @param auctionId ID of the created auction
+    event Barked(address indexed user, uint256 indexed tokenId, uint256 valueToBeBurned, uint256 auctionId);
+
+    /// @notice Emitted when protection is enabled on a position
+    /// @param user Address of the user
+    /// @param tokenId Token ID being protected
+    event Protect(address indexed user, uint256 indexed tokenId);
+
+    /// @notice Emitted when protection is removed from a position
+    /// @param user Address of the user
+    /// @param tokenId Token ID losing protection
+    event LiftProtection(address indexed user, uint256 indexed tokenId);
+
+    // ================= Modifiers =================
+
+    /// @notice Modifier to check if liquidation is enabled in protocol config
     modifier liquidationEnabled() {
         require(config.liquidationEnabled(), "LM/ Liquidation not enabled");
         _;
     }
-    
+
+    /// @notice Modifier to restrict function execution to specific roles
+    /// @param role The role identifier from ProtocolConfig
     modifier onlyRole(bytes32 role) {
         require(config.hasRole(role, msg.sender), "LM/ Caller missing required role");
         _;
     }
 
-
-    //================== 定义事件 =================
-    event TrancheVaultChanged(address indexed oldVault, address indexed newVault);
-    event AuctionManagerUpdated(address indexed oldAuctionManager, address indexed newAuctionManager);
-    event Barked(address user, uint256 tokenId, uint256 valueToBeBurned, uint256 auctionId);
-    event Protect(address user, uint256 tokenId);
-    event LiftProtection(address user, uint256 tokenId);
-    // ================= 构造函数 =================
+    // ================= Constructor =================
     constructor(
         address _config,
         address _LTokenAddress
@@ -71,66 +110,73 @@ contract LiquidationManager is ReentrancyGuard, ILiquidationManager {
         auctionManager = IAuctionManager(_auctionManager);
     }
 
-    // ================= 检查清算状态（销毁时需调用）================
-    function checkFreezeStatus(address user, uint256 tokenId) public view returns (bool isFreezed){
-        isFreezed = userLiquidationStatus[user][tokenId].isFreezed;
-    } 
+    // ================= View Functions =================
 
-    function checkLockStatus (address user, uint256 tokenId) public view returns (bool isLocked){
+
+    /// @notice Checks if a position has protection enabled
+    /// @param user Address of the user
+    /// @param tokenId Token ID to check
+    /// @return isLocked Whether the position is protected
+    function checkLockStatus(address user, uint256 tokenId) public view returns (bool isLocked) {
         isLocked = userLiquidationStatus[user][tokenId].isLocked;
-    } 
+    }
 
-   // ================= 清算保护 =================
-    
-    /**
-     * @dev 存入S锁定L，对L开启清算保护
-     * @param tokenId 杠杆币ID
-     */
+    // ================= Protection Management =================
 
-    function protectL( uint256 tokenId) public nonReentrant liquidationEnabled()
-    {
+    /// @notice Enables liquidation protection on a position by freezing stable tokens
+    /// @param tokenId Token ID to protect
+    /// @dev User must have positive balance and NAV must be above liquidation boundary.
+    /// Freezes stable tokens equivalent to the position's S token amount.
+    /// @custom:error NoBalance if user has no tokens
+    /// @custom:error PositionProtected if position is already protected
+    /// @custom:error NavTooLow if NAV is below liquidation boundary
+    function protectL(uint256 tokenId) public nonReentrant liquidationEnabled() {
         address user = msg.sender;
-        uint256 balance = leverageToken.balanceOfInWei(user, tokenId);
+        uint256 balance = leverageToken.balanceOf(user, tokenId);
         require(balance > 0, "LM/ No token to protect");
-        require(userLiquidationStatus[user][tokenId].isFreezed == false, "LM/ The token is under liquidation");
-        require(userLiquidationStatus[user][tokenId].isLocked == false, "LM/ The token is already under protection");
+        require(!userLiquidationStatus[user][tokenId].isLocked, "LM/ The token is already under protection");
+
         (
-            , // underlyingAmountInWei
-            , // mintPriceInWei
-            , // LTVInBps
-            uint256 sAmountInWei, 
-            uint256 lAmountInWei, 
-            , // creationTime
-            // isLocked
+            ,
+            ,
+            ,
+            uint256 sAmountInWei,
+            uint256 lAmountInWei,
+            ,
         ) = leverageToken.getTokenInfo(tokenId);
-        // 检查净值是否低于清算边界
+
         uint256 leverageRatio = lAmountInWei.wdiv(sAmountInWei);
         uint256 liquidationBoundary = config.liquidationThreshold().wdiv(leverageRatio);
         uint256 nav = _calculateNetAssetValue(user, tokenId);
         require(nav > liquidationBoundary, "LM/ Tokens with NAV below liquidation boundary cannot be protected");
 
-        // 冻结稳定币
         trancheVault.freezeStable(user, sAmountInWei);
         userLiquidationStatus[user][tokenId].isLocked = true;
         emit Protect(user, tokenId);
     }
 
-    function liftProtection(uint256 tokenId) public nonReentrant liquidationEnabled()
-    {
+    /// @notice Removes liquidation protection from a position and unfreezes stable tokens
+    /// @param tokenId Token ID to remove protection from
+    /// @dev User must have positive balance and NAV must be above liquidation boundary.
+    /// Unfreezes stable tokens equivalent to the position's S token amount.
+    /// @custom:error NoBalance if user has no tokens
+    /// @custom:error PositionNotProtected if position is not under protection
+    /// @custom:error NavTooLow if NAV is below liquidation boundary
+    function liftProtection(uint256 tokenId) public nonReentrant liquidationEnabled() {
         address user = msg.sender;
-        uint256 balance = leverageToken.balanceOfInWei(user, tokenId);
+        uint256 balance = leverageToken.balanceOf(user, tokenId);
         require(balance > 0, "LM/ No tokens");
-        require(userLiquidationStatus[user][tokenId].isLocked == true, "LM/ The tokens are not under protection");
+        require(userLiquidationStatus[user][tokenId].isLocked, "LM/ The tokens are not under protection");
+
         (
-            , // underlyingAmountInWei
-            , // mintPriceInWei
-            , // LTVInBps
-            uint256 sAmountInWei, 
-            uint256 lAmountInWei, 
-            , // creationTime
-            // isLocked
+            ,
+            ,
+            ,
+            uint256 sAmountInWei,
+            uint256 lAmountInWei,
+            ,
         ) = leverageToken.getTokenInfo(tokenId);
-        // 检查净值是否低于清算边界
+
         uint256 leverageRatio = lAmountInWei.wdiv(sAmountInWei);
         uint256 liquidationBoundary = config.liquidationThreshold().wdiv(leverageRatio);
         uint256 nav = _calculateNetAssetValue(user, tokenId);
@@ -141,86 +187,87 @@ contract LiquidationManager is ReentrancyGuard, ILiquidationManager {
         emit LiftProtection(user, tokenId);
     }
 
-    // ================= 清算功能 =================
-    
-    /**
-     * @dev 触发清算（类似MakerDAO的bark函数）
-     * @param user 被清算用户
-     * @param tokenId 杠杆币ID
-     * @param kpr Keeper地址（接收激励）
-     */
+
+    // ================= Liquidation Functions =================
+
+    /// @notice Triggers liquidation for a position (similar to MakerDAO's bark function)
+    /// @param user Address of the user being liquidated
+    /// @param tokenId Token ID to liquidate
+    /// @param kpr Keeper address receiving the incentive
+    /// @dev Only callable when liquidation is enabled. Creates an auction for the liquidated position.
+    /// @custom:error AuctionManagerNotSet if auction manager is not configured
+    /// @custom:error TrancheVaultNotSet if tranche vault is not configured
+    /// @custom:error ZeroAddress if user or keeper address is zero
+    /// @custom:error PositionProtected if position is protected
+    /// @custom:error NoTokens if user has no tokens
+    /// @custom:error NavAboveThreshold if NAV is above liquidation threshold
+    /// @custom:error NullAuction if value to be burned is zero
     function bark(
         address user,
         uint256 tokenId,
         address kpr
     ) external liquidationEnabled nonReentrant {
-        require(address(auctionManager) != address(0), 'LM/ Set auction address first!');
-        require(address(trancheVault) != address(0), 'LM/ Set Vault address first!');
-        require(address(leverageToken) != address(0), 'LM/ Set leverageToken address first!');
+        require(address(auctionManager) != address(0), "LM/ Set auction address first!");
+        require(address(trancheVault) != address(0), "LM/ Set Vault address first!");
         require(user != address(0), "LM/ Invalid user address");
         require(kpr != address(0), "LM/ Invalid keeper address");
-        require(userLiquidationStatus[user][tokenId].isFreezed == false, "LM/ The token is under liquidation");
-        require(userLiquidationStatus[user][tokenId].isLocked== false, "LM/ The token is under protection");
+        require(!userLiquidationStatus[user][tokenId].isLocked, "LM/ The token is under protection");
         uint256 balance = leverageToken.balanceOf(user, tokenId);
         require(balance > 0, "LM/ No tokens");
 
-        //調用LeverageToken合約中的mapping(uint256 => TokenInfo) public tokens;
-        //獲取用戶的SToken和LToken的數量
+        // Get token information from LeverageToken contract
         (
             , // underlyingAmountInWei
             , // mintPriceInWei
             , // LTVInBps
-            uint256 sAmountInWei, 
-            uint256 lAmountInWei, 
+            uint256 sAmountInWei,
+            uint256 lAmountInWei,
             , // creationTime
-            // isLocked
         ) = leverageToken.getTokenInfo(tokenId);
+
+        // Calculate liquidation boundary and check if NAV is below threshold
         uint256 leverageRatio = lAmountInWei.wdiv(sAmountInWei);
         uint256 liquidationBoundary = config.liquidationThreshold().wdiv(leverageRatio);
-        // 检查净值是否低于清算阈值
-        uint256 nav = _calculateNetAssetValue(user, tokenId);// 计算净值
+        uint256 nav = _calculateNetAssetValue(user, tokenId);
         require(nav < liquidationBoundary, "LM/ NAV above liquidation threshold");
 
-        // 计算将要销毁的稳定币价值
+        // Calculate stable token value to be burned
         uint256 valueToBeBurned = sAmountInWei;
         require(valueToBeBurned > 0, "LM/ Null auction");
 
-        // 计算用户残值 
-        uint256 underlyingValueToUser; 
+        // Calculate residual value to user after liquidation penalty
+        uint256 underlyingValueToUser;
         if (nav > config.liquidationPenalty()) {
-            underlyingValueToUser = MathUtils.wmul(nav - config.liquidationPenalty(), lAmountInWei); 
+            underlyingValueToUser = MathUtils.wmul(nav - config.liquidationPenalty(), lAmountInWei);
         } else {
             underlyingValueToUser = 0;
         }
-        
-        // 销毁杠杆币，并处理利息 (由 Vault 代理执行，确保权限安全)
+
+        // Burn leverage tokens and handle interest (executed by Vault for security)
         trancheVault.burnLTokenFromLiquidation(user, tokenId, lAmountInWei);
 
-        // 更新用户状态
-        userLiquidationStatus[user][tokenId].isFreezed = true;
-
-        // 创建荷兰式拍卖
-        uint256 auctionId =  auctionManager.startAuction(valueToBeBurned, user, tokenId, underlyingValueToUser, kpr);
+        // Create Dutch auction
+        uint256 auctionId = auctionManager.startAuction(valueToBeBurned, user, tokenId, underlyingValueToUser, kpr);
         emit Barked(user, tokenId, valueToBeBurned, auctionId);
     }
 
 
-    /**
-     * @dev 计算用户杠杆币的净值
-     */
+
+    // ================= Internal Functions =================
+
+    /// @notice Calculates the net asset value (NAV) for a user's leveraged position
+    /// @param user Address of the user
+    /// @param tokenId Token ID to calculate NAV for
+    /// @return nav The net asset value in wei
+    /// @custom:error InvalidOraclePrice if oracle price is invalid or zero
     function _calculateNetAssetValue(address user, uint256 tokenId) internal view returns (uint256 nav) {
         IOracleManager oracle = IOracleManager(trancheVault.OMAdrs());
         (uint256 currentPriceInWei, , bool isValid) = oracle.getLatestPriceView();
         require(isValid && currentPriceInWei > 0, "LM/ Invalid Oracle Price");
 
         ( , , uint256 netNavInWei, , , ) = trancheVault.getLTokenInfo(user, tokenId, currentPriceInWei);
-        nav = netNavInWei; // 返回净值
+        nav = netNavInWei;
     }
 
-    /**
-     * @dev 当拍卖结束时，更新清算状态 (由 AuctionManager 调用)
-     */
-    function _afterAuction(address usr, uint256 tokenID) external onlyRole(config.AUCTION_ROLE()) {
-        userLiquidationStatus[usr][tokenID].isFreezed = false; // 解冻
-    }
 }
+

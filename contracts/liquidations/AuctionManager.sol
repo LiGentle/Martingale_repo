@@ -13,43 +13,94 @@ import "../interfaces/IAuctionManager.sol";
 contract AuctionManager is ReentrancyGuard, IAuctionManager {
     using MathUtils for uint256;
 
-    // --- 数据 ---
+    // ================= Constants =================
+
+    /// @notice Circuit breaker levels
+    uint256 private constant CIRCUIT_BREAKER_START = 1;
+    uint256 private constant CIRCUIT_BREAKER_RESET = 2;
+    uint256 private constant CIRCUIT_BREAKER_BID = 3;
+
+    // ================= State Variables =================
+
+    /// @notice Protocol configuration contract (immutable)
     ProtocolConfig public immutable config;
+
+    /// @notice Stable token contract (immutable)
     StableToken public immutable stableToken;
-    
+
+    /// @notice Tranche vault interface
     ITrancheVault public trancheVault;
+
+    /// @notice Liquidation manager interface
     LiquidationManager public liquidationManager;
 
-    uint256 public totalAuctions = 0;
-    
-    // 循环优化 - 使用映射跟踪活跃拍卖
+    /// @notice Total number of auctions created
+    uint256 public totalAuctions;
+
+    /// @notice Mapping to track active auctions
     mapping(uint256 => bool) public isActiveAuction;
+
+    /// @notice Count of currently active auctions
     uint256 public activeAuctionCount;
 
+    // ================= Data Structures =================
 
+    /// @notice Auction structure containing all auction data
+    /// @param valueToBeBurned Amount of stable tokens to be burned [1e18]
+    /// @param originalOwner Address of the liquidated leveraged token owner
+    /// @param tokenId Token ID being liquidated
+    /// @param startTime Auction start timestamp
+    /// @param startingPrice Starting auction price [1e18]
+    /// @param currentPrice Current auction price [1e18]
     struct Auction {
-        uint256 valueToBeBurned;      // 需要銷毀的穩定幣的金額 [1e18]
-        address originalOwner;        // 被清算的杠杆币所有者
-        uint256 tokenId;              // tokenID
-        uint96  startTime;            // 拍卖开始时间
-        uint256 startingPrice;        // 起始价格 [1e18]
-        uint256 currentPrice;         // 当前价格 [1e18]
+        uint256 valueToBeBurned;
+        address originalOwner;
+        uint256 tokenId;
+        uint256 startTime;
+        uint256 startingPrice;
+        uint256 currentPrice;
     }
+
+    /// @notice Mapping of auction ID to auction data
     mapping(uint256 => Auction) public auctions;
 
-    // --- 事件 ---
+    // ================= Events =================
+
+    /// @notice Emitted when tranche vault address is updated
+    /// @param oldVault Previous vault address
+    /// @param newVault New vault address
     event TrancheVaultUpdated(address indexed oldVault, address indexed newVault);
+
+    /// @notice Emitted when liquidation manager address is updated
+    /// @param oldManager Previous liquidation manager address
+    /// @param newManager New liquidation manager address
     event LiquidationManagerUpdated(address indexed oldManager, address indexed newManager);
 
+    /// @notice Emitted when a new auction is started
+    /// @param auctionId Auction ID
+    /// @param valueToBeBurned Amount of stable tokens to be burned
+    /// @param startingPrice Starting auction price
+    /// @param originalOwner Address of the liquidated user
+    /// @param tokenId Token ID being liquidated
+    /// @param triggerer Address that triggered the liquidation
+    /// @param rewardValue Reward value for the triggerer
     event AuctionStarted(
         uint256 indexed auctionId,
         uint256 valueToBeBurned,
         uint256 startingPrice,
-        address originalOwner,
+        address indexed originalOwner,
         uint256 indexed tokenId,
-        address indexed triggerer,
+        address triggerer,
         uint256 rewardValue
     );
+
+    /// @notice Emitted when a purchase is made on an auction
+    /// @param auctionId Auction ID
+    /// @param currentPrice Current auction price
+    /// @param purchaseSlice Amount of underlying purchased
+    /// @param remainingValueToBeBurned Remaining value to be burned
+    /// @param kpr Address of the keeper making the purchase
+    /// @param originalOwner Address of the original owner
     event PurchaseMade(
         uint256 indexed auctionId,
         uint256 currentPrice,
@@ -58,94 +109,144 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
         address indexed kpr,
         address indexed originalOwner
     );
+
+    /// @notice Emitted when an auction is reset
+    /// @param auctionId Auction ID
+    /// @param valueToBeBurned Amount of stable tokens to be burned
+    /// @param newStartingPrice New starting price
+    /// @param originalOwner Address of the original owner
+    /// @param tokenId Token ID
+    /// @param triggerer Address that triggered the reset
+    /// @param rewardValue Reward value for the triggerer
     event AuctionReset(
         uint256 indexed auctionId,
         uint256 valueToBeBurned,
         uint256 newStartingPrice,
-        address originalOwner,
-        uint256 indexed tokenId,
-        address indexed triggerer,
+        address indexed originalOwner,
+        uint256 tokenId,
+        address triggerer,
         uint256 rewardValue
     );
-    event AuctionRemoved(uint256 auctionId);
-    event AuctionCancelled(uint256 auctionId);
 
-    // --- 修饰符 ---
+    /// @notice Emitted when an auction is removed
+    /// @param auctionId Auction ID
+    event AuctionRemoved(uint256 indexed auctionId);
+
+    /// @notice Emitted when an auction is cancelled
+    /// @param auctionId Auction ID
+    event AuctionCancelled(uint256 indexed auctionId);
+
+    // ================= Modifiers =================
+
+    /// @notice Modifier to restrict function execution to specific roles
+    /// @param role The role identifier from ProtocolConfig
     modifier onlyRole(bytes32 role) {
-        require(config.hasRole(role, msg.sender), "Caller missing required role");
+        require(config.hasRole(role, msg.sender), "AM/ Caller missing required role");
         _;
     }
 
-
+    /// @notice Modifier to check circuit breaker level
+    /// @param level Circuit breaker level to check against
     modifier checkCircuitBreaker(uint256 level) {
-        require(config.circuitBreaker() < level, 'CircuitBreaker error!');
+        require(config.circuitBreaker() < level, "AM/ Circuit breaker triggered");
         _;
     }
 
-    // --- 初始化 ---
+    // ================= Constructor =================
+
+    /// @notice Constructor to initialize the AuctionManager contract
+    /// @param _config Address of the ProtocolConfig contract
+    /// @param _STokenAddress Address of the StableToken contract
+    /// @custom:error ZeroAddressConfig if _config is zero address
+    /// @custom:error ZeroAddressStableToken if _STokenAddress is zero address
     constructor(
         address _config,
         address _STokenAddress
-    ) {      
-        require(_config != address(0), "Config cannot be zero address");
-        require(_STokenAddress != address(0), "StableToken address cannot be 0");
+    ) {
+        require(_config != address(0), "AM/ Config cannot be zero address");
+        require(_STokenAddress != address(0), "AM/ StableToken address cannot be 0");
         config = ProtocolConfig(_config);
-        stableToken = StableToken(_STokenAddress);  
+        stableToken = StableToken(_STokenAddress);
     }
 
-    // --- 管理功能 ---
+    // ================= Configuration Management =================
+
+    /// @notice Sets the tranche vault address
+    /// @param _trancheVault Address of the new tranche vault
+    /// @dev Only callable by accounts with DEFAULT_ADMIN_ROLE
+    /// @custom:error ZeroAddress if _trancheVault is zero address
     function setTrancheVault(address _trancheVault) external onlyRole(config.DEFAULT_ADMIN_ROLE()) {
+        require(_trancheVault != address(0), "AM/ Vault cannot be zero address");
         emit TrancheVaultUpdated(address(trancheVault), _trancheVault);
         trancheVault = ITrancheVault(_trancheVault);
     }
-    
+
+    /// @notice Sets the liquidation manager address
+    /// @param _liquidationManager Address of the new liquidation manager
+    /// @dev Only callable by accounts with DEFAULT_ADMIN_ROLE
+    /// @custom:error ZeroAddress if _liquidationManager is zero address
     function setLiquidationManager(address _liquidationManager) external onlyRole(config.DEFAULT_ADMIN_ROLE()) {
+        require(_liquidationManager != address(0), "AM/ Liquidation manager cannot be zero address");
         emit LiquidationManagerUpdated(address(liquidationManager), _liquidationManager);
         liquidationManager = LiquidationManager(_liquidationManager);
     }
-    
 
-    // --- 内部获取预言机价格 ---
-    function _getLatestPrice() internal view returns (uint256) {
-        require(address(trancheVault) != address(0), "Vault not set");
+    // ================= Internal Functions =================
+
+    /// @notice Gets the latest price from oracle
+    /// @return currentPrice Latest price in wei
+    /// @custom:error VaultNotSet if tranche vault is not configured
+    /// @custom:error InvalidOraclePrice if oracle price is invalid
+    function _getLatestPrice() internal view returns(uint256) {
+        require(address(trancheVault) != address(0), "AM/ Vault not set");
         IOracleManager oracle = IOracleManager(trancheVault.OMAdrs());
         (uint256 currentPrice, , bool isValid) = oracle.getLatestPriceView();
-        require(currentPrice > 0 && isValid, "Invalid oracle price!");
+        require(currentPrice > 0 && isValid, "AM/ Invalid oracle price");
         return currentPrice;
     }
 
-    // --- 拍卖功能 ---
+    // ================= Auction Management =================
 
-    // 开始拍卖
+    /// @notice Starts a new Dutch auction for liquidated collateral
+    /// @param valueToBeBurned Amount of stable tokens to be burned
+    /// @param originalOwner Address of the liquidated user
+    /// @param tokenId Token ID being liquidated
+    /// @param underlyingValueToUser Residual value to return to user
+    /// @param triggerer Address receiving the keeper reward
+    /// @return auctionId The ID of the created auction
+    /// @custom:error ZeroAddressOwner if originalOwner is zero address
+    /// @custom:error ZeroAddressTriggerer if triggerer is zero address
     function startAuction(
-        uint256 valueToBeBurned,  // 需被销毁的稳定币价值
-        address originalOwner,    // 被清算用户地址
-        uint256 tokenId,          // tokenID
-        uint256 underlyingValueToUser, // 返还给用户的残值
-        address triggerer         // 将接收激励的地址
-    ) external onlyRole(config.LIQUIDATION_ROLE()) nonReentrant checkCircuitBreaker(1) returns (uint256 auctionId) {
-        
+        uint256 valueToBeBurned,
+        address originalOwner,
+        uint256 tokenId,
+        uint256 underlyingValueToUser,
+        address triggerer
+    ) external onlyRole(config.LIQUIDATION_ROLE()) nonReentrant checkCircuitBreaker(CIRCUIT_BREAKER_START) returns (uint256 auctionId) {
+        require(originalOwner != address(0), "AM/ Original owner cannot be zero address");
+        require(triggerer != address(0), "AM/ Triggerer cannot be zero address");
+
         auctionId = ++totalAuctions;
         isActiveAuction[auctionId] = true;
         activeAuctionCount++;
 
         uint256 currentPrice = _getLatestPrice();
-        
+
         (
             uint256 priceMultiplier,
-            , // resetTime
-            , // priceDropThreshold
+            ,
+            ,
             uint256 percentageReward,
             uint256 fixedReward,
             uint256 minAuctionAmount
         ) = config.auctionParams();
 
-        uint256 startingPrice = currentPrice.wmul(priceMultiplier);
+        uint256 startingPrice = currentPrice.bmul(priceMultiplier);
 
         uint256 rewardValue;
         if (fixedReward > 0 || percentageReward > 0) {
             if (valueToBeBurned.wdiv(currentPrice) >= minAuctionAmount) {
-                rewardValue = fixedReward + (valueToBeBurned - minAuctionAmount.wmul(currentPrice)).wmul(percentageReward);
+                rewardValue = fixedReward + (valueToBeBurned - minAuctionAmount.wmul(currentPrice)).bmul(percentageReward);
             } else {
                 rewardValue = fixedReward;
             }
@@ -155,26 +256,32 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
         auctions[auctionId].valueToBeBurned = valueToBeBurned;
         auctions[auctionId].originalOwner = originalOwner;
         auctions[auctionId].tokenId = tokenId;
-        auctions[auctionId].startTime = uint96(block.timestamp);
-        
+        auctions[auctionId].startTime = block.timestamp;
+
         trancheVault.transferUnderlying(originalOwner, underlyingValueToUser.wdiv(currentPrice));
         trancheVault.transferUnderlying(triggerer, rewardValue.wdiv(currentPrice));
-        
+
         emit AuctionStarted(auctionId, valueToBeBurned, startingPrice, originalOwner, tokenId, triggerer, rewardValue);
     }
 
-    // 重置拍卖
+    /// @notice Resets an auction that hasn't been completed
+    /// @param auctionId Auction ID to reset
+    /// @param triggerer Address receiving the keeper reward
+    /// @dev Only callable when auction needs reset based on time and price conditions
+    /// @custom:error AuctionNotReady if auction doesn't need reset
+    /// @custom:error ZeroAddressTriggerer if triggerer is zero address
     function resetAuction(
-        uint256 auctionId,  // 要重置的拍卖ID
-        address triggerer   // 将接收激励的地址
-    ) external nonReentrant checkCircuitBreaker(2) {
+        uint256 auctionId,
+        address triggerer
+    ) external nonReentrant checkCircuitBreaker(CIRCUIT_BREAKER_RESET) {
+        require(triggerer != address(0), "AM/ Triggerer cannot be zero address");
         address originalOwner = auctions[auctionId].originalOwner;
-        uint96 startTime = auctions[auctionId].startTime;
+        uint256 startTime = auctions[auctionId].startTime;
         uint256 startingPrice = auctions[auctionId].startingPrice;
-        require(originalOwner != address(0), "Invalid Original Owner!");
+        require(originalOwner != address(0), "AM/ Invalid original owner");
 
         (bool needsReset,) = checkAuctionStatus(startTime, startingPrice);
-        require(needsReset, "Auction is not ready to be reset!");
+        require(needsReset, "AM/ Auction is not ready to be reset");
 
         uint256 valueToBeBurned = auctions[auctionId].valueToBeBurned;
         auctions[auctionId].startTime = uint96(block.timestamp);
@@ -190,13 +297,13 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
             uint256 minAuctionAmount
         ) = config.auctionParams();
 
-        startingPrice = currentPrice.wmul(priceMultiplier);
+        startingPrice = currentPrice.bmul(priceMultiplier);
         auctions[auctionId].startingPrice = startingPrice;
 
         uint256 rewardValue;
         if (fixedReward > 0 || percentageReward > 0) {
             if (valueToBeBurned.wdiv(currentPrice) >= minAuctionAmount) {
-                rewardValue = fixedReward + (valueToBeBurned - minAuctionAmount.wmul(currentPrice)).wmul(percentageReward);
+                rewardValue = fixedReward + (valueToBeBurned - minAuctionAmount.wmul(currentPrice)).bmul(percentageReward);
             } else {
                 rewardValue = fixedReward;
             }
@@ -214,31 +321,38 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
         }
     }
 
-    // 购买底层资产
+    /// @notice Bids on an active auction to purchase underlying assets
+    /// @param auctionId Auction ID to bid on
+    /// @param maxPurchaseAmount Maximum amount of underlying to purchase [Wei]
+    /// @param maxAcceptablePrice Maximum acceptable price [Wei]
+    /// @param receiver Address to receive the purchased underlying assets
+    /// @custom:error InsufficientApproval if user hasn't approved enough stable tokens
+    /// @custom:error AuctionNotReady if auction doesn't exist or isn't ready
+    /// @custom:error AuctionNeedsReset if auction requires reset
+    /// @custom:error PriceTooHigh if current price exceeds acceptable price
+    /// @custom:error InsufficientPurchaseAmount if purchase amount is below minimum
     function bid(
-        uint256 auctionId,           // 拍卖ID
-        uint256 maxPurchaseAmount,   // 购买underlying数量的上限 [Wei]
-        uint256 maxAcceptablePrice,  // 最高可接受价格 [Wei]
-        address receiver           // underlying接收者和外部调用地址
-    ) external nonReentrant checkCircuitBreaker(3) {
-        require(address(stableToken) != address(0), 'stableToken address is not set');
+        uint256 auctionId,
+        uint256 maxPurchaseAmount,
+        uint256 maxAcceptablePrice,
+        address receiver
+    ) external nonReentrant checkCircuitBreaker(CIRCUIT_BREAKER_BID) {
+        require(address(stableToken) != address(0), 'AM/ stableToken address is not set');
         ensureApproval(maxPurchaseAmount.wmul(maxAcceptablePrice));
         
         address originalOwner = auctions[auctionId].originalOwner;
-        require(originalOwner != address(0), "Auction not ready");
+        require(originalOwner != address(0), "AM/ Auction not ready");
 
-        uint96 startTime = auctions[auctionId].startTime;
+        uint256 startTime = auctions[auctionId].startTime;
         uint256 currentPrice;
-        {
-            bool needsReset;
-            (needsReset, currentPrice) = checkAuctionStatus(startTime, auctions[auctionId].startingPrice);
-            require(!needsReset, "Auction needs to be reset");
-        }
+        bool needsReset;
+        (needsReset, currentPrice) = checkAuctionStatus(startTime, auctions[auctionId].startingPrice);
+        require(!needsReset, "AM/ Auction needs to be reset");
 
-        require(maxAcceptablePrice >= currentPrice, "Current price is above acceptable price");
+        require(maxAcceptablePrice >= currentPrice, "AM/ Current price is above acceptable price");
 
         (,,,,, uint256 minAuctionAmount) = config.auctionParams();
-        require(maxPurchaseAmount >= minAuctionAmount, 'Purchase amount should be no less than the minimum purchase limit');
+        require(maxPurchaseAmount >= minAuctionAmount, "AM/ Purchase amount below minimum");
 
         uint256 valueToBeBurned = auctions[auctionId].valueToBeBurned;
         uint256 paymentAmount;
@@ -251,7 +365,7 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
             purchaseSlice = paymentAmount.wdiv(currentPrice);
         } else {
             uint256 residualAmount = (valueToBeBurned - paymentAmount).wdiv(currentPrice);
-            require(residualAmount > minAuctionAmount, 'Residual value is too small, please increase purchase amount');
+            require(residualAmount > minAuctionAmount, "AM/ Residual value too small");
         }
 
         auctions[auctionId].valueToBeBurned = valueToBeBurned - paymentAmount;
@@ -259,13 +373,10 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
         emit PurchaseMade(auctionId, currentPrice, purchaseSlice, auctions[auctionId].valueToBeBurned, receiver, originalOwner);
 
         if (auctions[auctionId].valueToBeBurned == 0) {
-            liquidationManager._afterAuction(originalOwner, auctions[auctionId].tokenId);
             removeAuction(auctionId);
         }
-
-        trancheVault.transferUnderlying(receiver, purchaseSlice);
-        
         trancheVault.burnSToken(msg.sender, paymentAmount);
+        trancheVault.transferUnderlying(receiver, purchaseSlice);    
     }
 
     function removeAuction(uint256 auctionId) internal {
@@ -284,9 +395,9 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
     }
 
     function getAuctionStatus(uint256 auctionId) external view returns (bool needsReset, uint256 currentPrice, uint256 valueToBeBurned) {
-        require(isActiveAuction[auctionId], 'The auction is not active');
+        require(isActiveAuction[auctionId], "AM/ Auction is not active");
         address originalOwner = auctions[auctionId].originalOwner;
-        uint96 startTime = auctions[auctionId].startTime;
+        uint256 startTime = auctions[auctionId].startTime;
 
         bool done;
         (done, currentPrice) = checkAuctionStatus(startTime, auctions[auctionId].startingPrice);
@@ -295,7 +406,7 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
         valueToBeBurned = auctions[auctionId].valueToBeBurned;
     }
 
-    function checkAuctionStatus(uint96 startTime, uint256 startingPrice) internal view returns (bool needsReset, uint256 currentPrice) {        
+    function checkAuctionStatus(uint256 startTime, uint256 startingPrice) internal view returns (bool needsReset, uint256 currentPrice) {        
         (,uint256 resetTime,uint256 priceDropThreshold,,,) = config.auctionParams();
         uint256 priceLowerBound = startingPrice.wmul(priceDropThreshold);
         require(priceLowerBound < startingPrice, "AM/ invalid priceDropThreshold");
@@ -308,9 +419,12 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
         }
     }
 
-    // 取消拍卖（紧急情况或治理操作）
+    /// @notice Cancels an active auction (emergency or governance action)
+    /// @param auctionId Auction ID to cancel
+    /// @dev Only callable by accounts with DEFAULT_ADMIN_ROLE
+    /// @custom:error AuctionNotStarted if auction hasn't been started
     function cancelAuction(uint256 auctionId) external onlyRole(config.DEFAULT_ADMIN_ROLE()) nonReentrant {
-        require(auctions[auctionId].originalOwner != address(0), "Auction not started");
+        require(auctions[auctionId].originalOwner != address(0), "AM/ Auction not started");
         removeAuction(auctionId);
         emit AuctionCancelled(auctionId);
     }

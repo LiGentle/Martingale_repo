@@ -246,7 +246,6 @@ contract TrancheVault is ITrancheVault, ReentrancyGuard {
     ){
         require(burnPercentageInBps > 0 && burnPercentageInBps <= config.BPS_DENOMINATOR(), "Invalid percentage");
         require(leverageToken.balanceOf(msg.sender, tokenId) > 0, "No L tokens to burn");
-        require(liquidationManager.checkFreezeStatus(msg.sender, tokenId)==false, "Cannot burn when frozen");
 
         (uint256 currentPriceInWei, , bool isValid) = oracleManager.getLatestPriceView();
         require(isValid && currentPriceInWei > 0, "Invalid price");

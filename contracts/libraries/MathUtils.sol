@@ -8,6 +8,8 @@ pragma solidity ^0.8.20;
  */
 library MathUtils {
     uint256 internal constant PRECISION_UNIT = 1e18;
+    uint256 internal constant BPS_DENOMINATOR = 1e4;
+
 
     /**
      * @dev 返回两个相中的最小值
@@ -39,5 +41,36 @@ library MathUtils {
     function wdiv(uint256 x, uint256 y) internal pure returns (uint256) {
         // (x * 1e18) / y
         return (x * PRECISION_UNIT) / y;
+    }
+
+    /**
+     * @dev BPS 乘法 (基于精度1e4的乘法)
+     * e.g. bmul(2e18, 2e4) = 4e18
+     */
+    function bmul(uint256 x, uint256 y) internal pure returns (uint256) {
+        // (x * y) / 1e18
+        return (x * y) / BPS_DENOMINATOR;
+    }
+
+    /**
+     * @dev 计算两个值的百分比偏差 (基点)
+     * @param currentValue 当前值
+     * @param newValue 新值
+     * @return deviationBps 偏差基点 (100 = 1%)
+     * e.g. calcDeviationBps(100e18, 105e18) = 500 (5% deviation)
+     */
+    function calcDeviationBps(uint256 currentValue, uint256 newValue) internal pure returns (uint256 deviationBps) {
+        if (currentValue == 0) {
+            // 如果当前值为0，任何非零新值都被认为是100%偏差
+            return newValue > 0 ? 10_000 : 0;
+        }
+        uint256 diff;
+        if (newValue >= currentValue) {
+            diff = newValue - currentValue;
+        } else {
+            diff = currentValue - newValue;
+        }
+        // (diff / currentValue) * 10_000
+        deviationBps = (diff * 10_000) / currentValue;
     }
 }

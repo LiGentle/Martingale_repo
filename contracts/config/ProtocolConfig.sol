@@ -40,10 +40,10 @@ contract ProtocolConfig is AccessControl {
     }
 
     struct AuctionParams {
-        uint256 priceMultiplier;     // 增加起始价格的乘数因子 
+        uint256 priceMultiplier;     // 增加起始价格的乘数因子   精度为10000，即12000表示1.2倍
         uint256 resetTime;           // 拍卖有效期 [seconds]
         uint256 priceDropThreshold;  // 拍卖价格下限乘子
-        uint256 percentageReward;    // 激励keeper的百分比费用 
+        uint256 percentageReward;    // 激励keeper的百分比费用  精度为10000，即100表示1%
         uint256 fixedReward;         // 激励keeper的固定费用 
         uint256 minAuctionAmount;    // 最小购买数量 
     }
@@ -59,6 +59,7 @@ contract ProtocolConfig is AccessControl {
     struct OracleParams {
         uint256 delay;
         uint256 maxPriceAge;
+        uint256 maxPriceDeviationBps; // Maximum allowed price deviation in basis points (e.g., 500 = 5%)
     }
 
     /* ==================== STATE VARIABLES ==================== */
@@ -90,7 +91,7 @@ contract ProtocolConfig is AccessControl {
     event MintFeeUpdated(uint16 oldFeeBps, uint16 newFeeBps);
     event BurnFeeUpdated(uint16 oldFeeBps, uint16 newFeeBps);
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
-    event OracleParamsUpdated(uint256 oldDelay, uint256 oldMaxPriceAge, uint256 newDelay, uint256 newMaxPriceAge);   
+    event OracleParamsUpdated(uint256 oldDelay, uint256 oldMaxPriceAge, uint256 oldDeviation, uint256 newDelay, uint256 newMaxPriceAge,  uint256 newDeviation);   
     event MaxLTVUpdated(uint256 oldMaxLTVBps, uint256 newMaxLTVBps);
     event MaxLTVUpdateScheduled(uint256 newMaxLTVBps, uint256 executeTime);     
     event LiquidationParamsUpdated(uint256 liquidationThreshold, uint256 liquidationPenalty);
@@ -122,15 +123,16 @@ contract ProtocolConfig is AccessControl {
         // Initialize default oracle params
         oracleParams = OracleParams({
             delay: 3600,
-            maxPriceAge: 7200
+            maxPriceAge: 7200,
+            maxPriceDeviationBps: 500 // Default 5% deviation threshold
         });
 
         // Initialize default auction params
         auctionParams = AuctionParams({
-            priceMultiplier: 12 * 10**17,    
+            priceMultiplier: 1 * BPS_DENOMINATOR,    
             resetTime: 3600,                 
             priceDropThreshold: 8 * 10**17,  
-            percentageReward: 1 * 10**16,    
+            percentageReward: 1 * BPS_DENOMINATOR/100,    
             fixedReward: 10 * 10**18,        
             minAuctionAmount: 100 * 10**18   
         });
@@ -183,13 +185,15 @@ contract ProtocolConfig is AccessControl {
         feeRecipient = newRecipient;
         emit FeeRecipientUpdated(old, newRecipient);
     }
-    function setOracleParams(uint256 newDelay, uint256 newMaxPriceAge) external onlyRole(PARAM_ROLE) {
+    function setOracleParams(uint256 newDelay, uint256 newMaxPriceAge, uint256 newMaxPriceDeviationBps) external onlyRole(PARAM_ROLE) {
         if (newDelay==0 || newMaxPriceAge == 0) revert InvalidOracleParams();
         uint256 oldDelay = oracleParams.delay;
         uint256 oldMaxPriceAge = oracleParams.maxPriceAge;
+        uint256 oldMaxPriceDeviationBps = oracleParams.maxPriceDeviationBps;
         oracleParams.delay = newDelay;
         oracleParams.maxPriceAge = newMaxPriceAge;
-        emit OracleParamsUpdated(oldDelay, oldMaxPriceAge, newDelay, newMaxPriceAge);
+        oracleParams.maxPriceDeviationBps = newMaxPriceDeviationBps;
+        emit OracleParamsUpdated(oldDelay, oldMaxPriceAge,oldMaxPriceDeviationBps, newDelay, newMaxPriceAge, newMaxPriceDeviationBps);
     }
     function setFees(uint16 newmintFeeInBps, uint16 newburnFeeInBps) external onlyRole(PARAM_ROLE) {
         if (newmintFeeInBps > MAX_FEE_BPS) revert InvalidFeeBps(newmintFeeInBps);   
