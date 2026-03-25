@@ -194,14 +194,12 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
     // ================= Internal Functions =================
 
     /// @notice Gets the latest price from oracle
-    /// @return currentPrice Latest price in wei
+    /// @return currentPrice Latest no delay price in wei
     /// @custom:error VaultNotSet if tranche vault is not configured
-    /// @custom:error InvalidOraclePrice if oracle price is invalid
     function _getLatestPrice() internal view returns(uint256) {
         require(address(trancheVault) != address(0), "AM/ Vault not set");
         IOracleManager oracle = IOracleManager(trancheVault.OMAdrs());
-        (uint256 currentPrice, , bool isValid) = oracle.getLatestPriceView();
-        require(currentPrice > 0 && isValid, "AM/ Invalid oracle price");
+        uint256 currentPrice = oracle.getNoDelayPrice();
         return currentPrice;
     }
 

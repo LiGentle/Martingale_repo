@@ -173,6 +173,45 @@ contract OracleManager is IOracleManager, ReentrancyGuard {
         timestamp = pendingPriceTimestamp;
     }
 
+    /// @notice Gets the no delay price for auctions
+    /// @return priceXAU The no delay price for XAU/USDT
+    function getNoDelayPrice() onlyRole(config.AUCTION_ROLE()) external view returns (uint256 priceXAU) {
+                // Fetch latest price data from Chainlink
+        (
+        uint80 roundID,
+        int256 rawPrice,
+        /*uint256 startedAt*/,
+        uint256 timestamp,
+        uint80 answeredInRound
+        ) = priceFeedXAU.latestRoundData();
+        uint256 decimalsXAU = uint256(priceFeedXAU.decimals());
+
+        // Validate price data - multiple checks for security
+        require(rawPrice > 0, "Invalid price data: price <= 0");
+        require(timestamp > 0, "Invalid price data: round not complete");
+        require(answeredInRound == roundID, "Invalid price data: stale price");
+
+        // Fetch latest price data from Chainlink
+        (
+        uint80 roundIDUSDT,
+        int256 priceUSDT,
+        /*uint256 startedAt*/,
+        uint256 timestampUSDT,
+        uint80 answeredInRoundUSDT
+        ) = priceFeedUSDT.latestRoundData();
+        uint256 decimalsUSDT = uint256(priceFeedUSDT.decimals());
+
+
+        // Validate price data - multiple checks for security
+        require(priceUSDT > 0, "Invalid price data: price <= 0");
+        require(timestampUSDT > 0, "Invalid price data: round not complete");
+        require( answeredInRoundUSDT == roundIDUSDT, "Invalid price data: stale price");
+
+
+        priceXAU = (uint256(rawPrice).wdiv(10**decimalsXAU)).wdiv(uint256(priceUSDT).wdiv(10**decimalsUSDT)) ;
+
+    }
+
     // ================= Emergency Management =================
 
     /// @notice Activates emergency stop mode, blocking all price updates and queries
@@ -189,6 +228,11 @@ contract OracleManager is IOracleManager, ReentrancyGuard {
         require(emergencyStop, "Not in emergency stop mode");
         emergencyStop = false;
         emit EmergencyStopSet(false);
+    }
+
+    /// 仅用于测试，如上main net请务必将如下函数删除
+    function setPrice(uint256 price) public onlyRole(config.DEFAULT_ADMIN_ROLE()){
+        currentPrice = price;
     }
 
 }
