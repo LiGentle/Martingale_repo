@@ -129,10 +129,10 @@ contract ProtocolConfig is AccessControl {
 
         // Initialize default auction params
         auctionParams = AuctionParams({
-            priceMultiplier: 1 * BPS_DENOMINATOR,    
+            priceMultiplier: 1 * uint256(BPS_DENOMINATOR),    
             resetTime: 3600,                 
-            priceDropThreshold: 8 * 10**17,  
-            percentageReward: 1 * BPS_DENOMINATOR/100,    
+            priceDropThreshold: (9 * uint256(BPS_DENOMINATOR)) / 10,  
+            percentageReward: (1 * uint256(BPS_DENOMINATOR)) / 100,    
             fixedReward: 10 * 10**18,        
             minAuctionAmount: 100 * 10**18   
         });

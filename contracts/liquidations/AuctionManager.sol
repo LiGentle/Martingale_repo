@@ -406,7 +406,7 @@ contract AuctionManager is ReentrancyGuard, IAuctionManager {
 
     function checkAuctionStatus(uint256 startTime, uint256 startingPrice) internal view returns (bool needsReset, uint256 currentPrice) {        
         (,uint256 resetTime,uint256 priceDropThreshold,,,) = config.auctionParams();
-        uint256 priceLowerBound = startingPrice.wmul(priceDropThreshold);
+        uint256 priceLowerBound = startingPrice.bmul(priceDropThreshold);
         require(priceLowerBound < startingPrice, "AM/ invalid priceDropThreshold");
         uint256 timeElapsed = block.timestamp - startTime;
         needsReset = timeElapsed >= resetTime;
